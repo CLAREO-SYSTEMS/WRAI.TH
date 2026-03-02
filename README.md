@@ -86,9 +86,19 @@ cd claude-agentic-relay
 make install    # build + service + skill
 ```
 
-### Connect an agent
+If `make install` fails on `sudo`, install manually:
 
-Add to any project's `.mcp.json`:
+```bash
+make build                                          # build binary
+cp agent-relay ~/.local/bin/                         # or /usr/local/bin with sudo
+cp skill/relay.md ~/.claude/commands/relay.md        # install /relay skill
+```
+
+Make sure `~/.local/bin` is in your `PATH` (add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc`).
+
+### Add to another project
+
+To give any Claude Code session access to the relay, add to its `.mcp.json`:
 
 ```json
 {
