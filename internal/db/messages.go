@@ -133,6 +133,31 @@ func (d *DB) GetMessage(id string) (*models.Message, error) {
 	return &msgs[0], nil
 }
 
+// FindMessageByPrefix resolves a short ID prefix to a full message ID.
+// Returns the full ID if exactly one match is found.
+func (d *DB) FindMessageByPrefix(prefix string) (string, error) {
+	var ids []string
+	rows, err := d.conn.Query("SELECT id FROM messages WHERE id LIKE ?", prefix+"%")
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return "", err
+		}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return "", fmt.Errorf("no message found with prefix %q", prefix)
+	}
+	if len(ids) > 1 {
+		return "", fmt.Errorf("ambiguous prefix %q (%d matches)", prefix, len(ids))
+	}
+	return ids[0], nil
+}
+
 func (d *DB) queryMessages(query string, args ...any) ([]models.Message, error) {
 	rows, err := d.conn.Query(query, args...)
 	if err != nil {

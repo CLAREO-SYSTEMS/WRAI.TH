@@ -2,16 +2,46 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
 
+	"agent-relay/internal/cli"
 	"agent-relay/internal/db"
 	"agent-relay/internal/relay"
 )
 
+var Version = "dev"
+
 func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--version":
+			fmt.Printf("agent-relay %s\n", Version)
+			return
+		case "--help", "-h":
+			cli.Run([]string{"help"})
+			return
+		case "serve":
+			startServer()
+			return
+		case "status", "agents", "inbox", "send", "thread", "stats":
+			cli.Run(os.Args[1:])
+			return
+		default:
+			fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", os.Args[1])
+			cli.Run([]string{"help"})
+			os.Exit(1)
+		}
+	}
+
+	// No args → start server (backward compat).
+	startServer()
+}
+
+func startServer() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("agent-relay starting...")
 
@@ -28,7 +58,6 @@ func main() {
 		addr = ":" + v
 	}
 
-	// Graceful shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 

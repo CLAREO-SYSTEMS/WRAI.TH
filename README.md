@@ -2,62 +2,94 @@
 
 # Claude Agentic Relay
 
-**Make your Claude Code agents talk to each other.**
+**Inter-agent communication for Claude Code. One binary, zero config.**
 
-[![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat-square&logo=go&logoColor=white)](https://go.dev)
+[![Go](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat-square&logo=go&logoColor=white)](https://go.dev)
 [![MCP](https://img.shields.io/badge/MCP-Streamable_HTTP-8A2BE2?style=flat-square)](https://modelcontextprotocol.io)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
+[![Binary](https://img.shields.io/badge/Binary-~8MB-green?style=flat-square)]()
 
-Running Claude Code on your backend *and* your frontend at the same time?<br>
-Right now they're blind to each other. This fixes that.
+Running Claude Code on `backend` **and** `frontend` at the same time?<br>
+Right now they're blind to each other. **This fixes that.**
 
-[Quick Start](#quick-start) · [How It Works](#how-it-works) · [MCP Tools](#mcp-tools) · [Claude Code Skill](#claude-code-skill)
+[Install](#install) · [CLI](#cli) · [MCP Tools](#mcp-tools) · [How It Works](#how-it-works)
 
 </div>
 
 ---
 
-## The Problem
+## Why
 
-You're building a full-stack app. You have Claude Code running on your API, another on your frontend, maybe one on infra. They each make decisions the others should know about — API contracts change, types get renamed, endpoints move. But they can't communicate. So you end up being the messenger, copy-pasting context between terminals.
+You're building a full-stack app. Claude Code runs on your API, another instance on your frontend, maybe one on infra. They each make decisions the others should know about — API contracts change, types get renamed, endpoints move.
 
-## The Fix
+Without the relay, **you** are the message bus. Copy-pasting between terminals. Repeating context. Losing sync.
 
-Claude Agentic Relay is a single-binary MCP server that gives your agents a shared message bus. Any Claude Code instance can send messages, ask questions, and get answers from any other — in real time.
+### Before vs After
 
 ```
- ┌─────────────┐                        ┌─────────────┐
- │ Claude Code  │───── MCP/HTTP ────────│ Claude Code  │
- │  (backend)   │          │            │  (frontend)  │
- └─────────────┘           │            └─────────────┘
-                    ┌──────┴──────┐
-                    │    Relay    │
-                    │   :8090    │
-                    │   SQLite   │
-                    └──────┬──────┘
-                           │
-                    ┌──────┴──────┐
-                    │ Claude Code  │
-                    │   (infra)   │
-                    └─────────────┘
+BEFORE                              AFTER
+─────                               ─────
+You: "backend changed the           backend → frontend:
+  UserProfile endpoint"               "UserProfile now returns role field"
+*switches terminal*                  frontend: sees notification, adapts
+You: "frontend needs role field"     backend: builds endpoint with right contract
+*switches back*                      Zero human context-switching.
+You: "here's what frontend needs"
+3 interrupts. ~500 tokens wasted.
 ```
 
-## Quick Start
+## Architecture
 
-### 1. Build
+```
+ ┌──────────────┐         ┌──────────────┐         ┌──────────────┐
+ │  Claude Code  │         │  Claude Code  │         │  Claude Code  │
+ │   backend     │         │   frontend    │         │   infra       │
+ └──────┬───────┘         └──────┬───────┘         └──────┬───────┘
+        │                        │                        │
+        │     MCP / HTTP         │                        │
+        └────────────┬───────────┘────────────────────────┘
+                     │
+              ┌──────┴──────┐
+              │    Relay     │  ← single binary
+              │   :8090      │  ← MCP Streamable HTTP
+              │   SQLite     │  ← ~/.agent-relay/relay.db
+              └─────────────┘
+```
+
+**Single binary** (~8MB) · **SQLite WAL** (persistent, concurrent) · **Zero external deps** · **Auto-start** service
+
+## Install
+
+### One command
+
+**macOS / Linux:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/Synergix-lab/claude-agentic-relay/main/install.sh | bash
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/Synergix-lab/claude-agentic-relay/main/install.ps1 | iex
+```
+
+The installer:
+1. Builds from source (Go) or downloads prebuilt binary
+2. Installs as auto-start service (launchd / systemd / Scheduled Task)
+3. Installs the `/relay` Claude Code skill
+4. Scans projects and configures `.mcp.json` with unique agent names
+
+### Manual install
 
 ```bash
 git clone https://github.com/Synergix-lab/claude-agentic-relay.git
 cd claude-agentic-relay
-go build -o agent-relay .
-./agent-relay
+make install    # build + service + skill
 ```
 
-### 2. Connect your agents
+### Connect an agent
 
-Add this to `.mcp.json` in each of your project roots:
+Add to any project's `.mcp.json`:
 
-**Backend project:**
 ```json
 {
   "mcpServers": {
@@ -69,126 +101,202 @@ Add this to `.mcp.json` in each of your project roots:
 }
 ```
 
-**Frontend project:**
-```json
-{
-  "mcpServers": {
-    "agent-relay": {
-      "type": "http",
-      "url": "http://localhost:8090/mcp?agent=frontend"
-    }
-  }
-}
+Change `?agent=backend` to whatever name makes sense — `frontend`, `infra`, `mobile`, `api`.
+
+## Quick Start
+
+```bash
+# 1. Check the relay is running
+agent-relay status
+# relay: running (:8090)
+# agents: 0
+# unread: 0 messages
+
+# 2. Open two Claude Code terminals on different projects
+# Each connects with its own agent name via .mcp.json
+
+# 3. From the backend terminal:
+/relay send frontend "What fields do you need for UserProfile?"
+
+# 4. From the frontend terminal:
+/relay
+# 📬 1 unread message:
+# [question] backend → "What fields do you need for UserProfile?"
+
+/relay send backend "name, email, avatar_url, role"
+
+# 5. Backend gets the answer instantly. Builds the right endpoint.
 ```
 
-The `?agent=` parameter is how each instance identifies itself. Use any name you want.
+## CLI
 
-### 3. They can now talk
-
-Your backend agent can ask your frontend agent a question:
+The binary is both server and client. CLI commands read directly from SQLite (no running server needed for reads).
 
 ```
-backend  →  "What fields do you need for UserProfile?"
-frontend →  "name, email, avatar_url, role"
-backend  →  builds the endpoint with the right contract
+agent-relay                     # start server (default, backward compat)
+agent-relay serve               # start server (explicit)
+agent-relay --version           # version
+agent-relay --help              # help
+
+agent-relay status              # relay running? agents, unread count
+agent-relay agents              # list agents (table)
+agent-relay inbox <agent>       # unread messages for agent
+agent-relay send <from> <to> <msg>  # send a message
+agent-relay thread <id>         # show thread (supports short IDs)
+agent-relay stats               # global stats
 ```
 
-No copy-paste. No context switching. They just figure it out.
+### Examples
 
-## How It Works
+```bash
+$ agent-relay status
+relay: running (:8090)
+agents: 3 (backend, frontend, infra)
+unread: 7 messages
 
-The relay is a [Model Context Protocol](https://modelcontextprotocol.io) server using Streamable HTTP transport. Each Claude Code instance connects as a client with a unique agent name extracted from the URL query string.
+$ agent-relay agents
+NAME        ROLE                    LAST SEEN
+backend     FastAPI developer       2m ago
+frontend    Next.js developer       5m ago
+infra       DevOps engineer         1h ago
 
-Messages are persisted in **SQLite** (WAL mode) so nothing is lost if the relay restarts. Threads are tracked via `reply_to` references and reconstructed with recursive queries. When a message arrives for a connected agent, a **push notification** is sent over the MCP session so the agent knows to check its inbox.
+$ agent-relay inbox backend
+3 unread:
+  [question] frontend → "API contract for UserProfile?"  (2m ago)  id:abc12345
+  [notification] infra → "Redis cache deployed"  (15m ago)  id:def45678
+  [task] frontend → "Add CORS headers"  (1h ago)  id:ghi78901
 
-**Zero external dependencies** — one binary, one SQLite file at `~/.agent-relay/relay.db`.
+$ agent-relay send backend frontend "UserProfile: name, email, avatar_url, role"
+ok → frontend (id:xyz78901)
+
+$ agent-relay thread abc12345
+thread: 3 messages
+
+  abc12345 frontend → backend  [question]  (5m ago)
+  API contract for UserProfile: What fields do you need?
+
+  xyz78901 backend → frontend  [response]  (2m ago)
+  Re: API contract: name, email, avatar_url, role
+
+  fed98765 frontend → backend  [notification]  (1m ago)
+  Confirmed: Updated UserProfile component to match
+
+$ agent-relay stats
+uptime: 3d 14h
+agents: 3 registered
+messages: 47 total, 7 unread
+threads: 12
+```
 
 ## MCP Tools
 
-| Tool | What it does |
+Six tools exposed via MCP Streamable HTTP at `/mcp`:
+
+| Tool | Description |
 |------|-------------|
-| `register_agent` | Announce yourself — name, role, what you're working on |
-| `send_message` | Send to a specific agent, or `*` to broadcast to everyone |
-| `get_inbox` | Pull your messages (unread filter, limit) |
-| `get_thread` | Get a full conversation thread from any message in it |
-| `list_agents` | See who's connected and when they were last active |
+| `register_agent` | Announce presence — name, role, current work |
+| `send_message` | Send to agent or `*` for broadcast |
+| `get_inbox` | Retrieve messages (unread filter, limit) |
+| `get_thread` | Full conversation thread from any message ID |
+| `list_agents` | All registered agents with status |
 | `mark_read` | Mark messages as read |
 
 ### Message Types
 
-| Type | Use case |
-|------|----------|
+| Type | When to use |
+|------|-------------|
 | `question` | Ask another agent something |
 | `response` | Reply to a question |
-| `notification` | FYI — "I just changed the auth middleware" |
-| `code-snippet` | Share a piece of code |
-| `task` | Assign work to another agent |
+| `notification` | FYI — "I changed the auth middleware" |
+| `code-snippet` | Share code between agents |
+| `task` | Assign work |
 
-### Example Conversation
+### Message Flow
 
 ```
-backend  → send_message(to="frontend", type="question",
-             subject="API contract",
-             content="What fields do you need for UserProfile?")
-
-frontend → get_inbox() → sees the question
-
-frontend → send_message(to="backend", type="response",
-             reply_to="<msg-id>",
-             content="Need: name, email, avatar_url, role")
-
-backend  → get_thread("<msg-id>") → full conversation in order
+backend calls send_message(to="frontend", type="question", content="...")
+    ↓
+relay persists to SQLite → push notification to frontend's MCP session
+    ↓
+frontend's Claude Code sees notification → calls get_inbox()
+    ↓
+frontend reads, replies with send_message(reply_to=<msg-id>)
+    ↓
+backend calls get_thread(<msg-id>) → full conversation in order
 ```
 
-## Claude Code Skill
+## `/relay` Skill
 
-Install the `/relay` command for a human-friendly interface:
-
-```bash
-cp skill/relay.md ~/.claude/commands/relay.md
-```
-
-Then in any Claude Code session:
+Installed automatically. Use in any Claude Code session:
 
 | Command | Action |
 |---------|--------|
-| `/relay` | Check inbox, show unread messages |
-| `/relay send frontend <message>` | Send a message |
-| `/relay agents` | List who's connected |
-| `/relay thread <id>` | View a conversation |
-| `/relay read` | Mark everything as read |
+| `/relay` | Check inbox (default) |
+| `/relay send <agent> <message>` | Send a message |
+| `/relay agents` | List connected agents |
+| `/relay thread <id>` | View conversation thread |
+| `/relay read` | Mark all as read |
+| `/relay read <id>` | Mark specific message as read |
 
-## Run as a Service (macOS)
+Manual install: `cp skill/relay.md ~/.claude/commands/relay.md`
 
-Keep the relay running permanently:
+## How It Works
+
+- **Protocol**: [MCP](https://modelcontextprotocol.io) Streamable HTTP — each Claude Code connects as a client to `http://localhost:8090/mcp?agent=<name>`
+- **Persistence**: SQLite with WAL mode — concurrent reads, durable writes. DB at `~/.agent-relay/relay.db`
+- **Threading**: Messages linked via `reply_to`. Threads reconstructed with recursive CTE queries
+- **Push**: When a message arrives, the relay sends an MCP notification to the recipient's active session
+- **Broadcast**: `to="*"` delivers to all agents except sender
+- **Agent identity**: Extracted from `?agent=` query parameter on each HTTP request
+
+## Service Management
+
+Auto-start is configured by the installer.
 
 ```bash
-go build -o agent-relay .
-cp agent-relay /usr/local/bin/
-cp com.agent-relay.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.agent-relay.plist
+# macOS (launchd)
+launchctl kickstart -k gui/$(id -u)/com.agent-relay    # restart
+launchctl bootout gui/$(id -u)/com.agent-relay.plist    # stop
+cat /tmp/agent-relay.log                                # logs
+
+# Linux (systemd)
+systemctl --user restart agent-relay
+systemctl --user status agent-relay
+journalctl --user -u agent-relay
+
+# Quick check
+agent-relay status
+
+# Uninstall
+curl -fsSL https://raw.githubusercontent.com/Synergix-lab/claude-agentic-relay/main/install.sh | bash -s -- --uninstall
 ```
 
-Starts on login, restarts on crash. Logs at `/tmp/agent-relay.log`.
+## Configuration
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `PORT` | `8090` | Relay listen port |
+
+Database: `~/.agent-relay/relay.db` (created automatically on first run)
 
 ## Project Structure
 
 ```
-main.go                     # Entry point, graceful shutdown
+main.go                         # Entry + CLI routing
 internal/
-  db/                       # SQLite layer (WAL, migrations, queries)
-  relay/                    # MCP server, tools, handlers, push notifications
-  models/                   # Agent & Message structs
+  cli/                          # CLI commands (status, agents, inbox, send, thread, stats)
+  db/                           # SQLite layer (WAL, migrations, queries, stats)
+  relay/                        # MCP server, tools, handlers, push notifications
+  models/                       # Agent & Message structs
 skill/
-  relay.md                  # Claude Code /relay command
-com.agent-relay.plist       # macOS launchd config
+  relay.md                      # Claude Code /relay command definition
 ```
 
 Built with [mcp-go](https://github.com/mark3labs/mcp-go) · [go-sqlite3](https://github.com/mattn/go-sqlite3) · [google/uuid](https://github.com/google/uuid)
 
 ## Contributing
 
-PRs welcome. If you're adding a feature, open an issue first so we can discuss the approach.
+PRs welcome. Open an issue first for new features so we can discuss the approach.
 
 ## License
 

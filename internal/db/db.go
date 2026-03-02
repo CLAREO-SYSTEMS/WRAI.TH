@@ -11,6 +11,7 @@ import (
 
 type DB struct {
 	conn *sql.DB
+	path string
 }
 
 func New() (*DB, error) {
@@ -37,11 +38,47 @@ func New() (*DB, error) {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 
-	return &DB{conn: conn}, nil
+	return &DB{conn: conn, path: dbPath}, nil
 }
 
 func (d *DB) Close() error {
 	return d.conn.Close()
+}
+
+// Path returns the database file path.
+func (d *DB) Path() string {
+	return d.path
+}
+
+// DBPath returns the default database path without opening it.
+func DBPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".agent-relay", "relay.db"), nil
+}
+
+// NewReadOnly opens the database in read-only mode for CLI queries.
+// Does not run migrations or create the directory.
+func NewReadOnly() (*DB, error) {
+	dbPath, err := DBPath()
+	if err != nil {
+		return nil, fmt.Errorf("get db path: %w", err)
+	}
+
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("database not found at %s (relay never started?)", dbPath)
+	}
+
+	conn, err := sql.Open("sqlite3", dbPath+"?mode=ro&_busy_timeout=5000")
+	if err != nil {
+		return nil, fmt.Errorf("open db readonly: %w", err)
+	}
+
+	conn.SetMaxOpenConns(1)
+
+	return &DB{conn: conn, path: dbPath}, nil
 }
 
 func migrate(conn *sql.DB) error {
