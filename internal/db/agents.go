@@ -77,6 +77,18 @@ func (d *DB) ListAgents() ([]models.Agent, error) {
 	return agents, rows.Err()
 }
 
+// PurgeStaleAgents removes agents whose last_seen is older than the given duration.
+// Returns the number of agents removed.
+func (d *DB) PurgeStaleAgents(maxAge time.Duration) (int, error) {
+	cutoff := time.Now().UTC().Add(-maxAge).Format(time.RFC3339)
+	result, err := d.conn.Exec("DELETE FROM agents WHERE last_seen < ?", cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("purge stale agents: %w", err)
+	}
+	n, _ := result.RowsAffected()
+	return int(n), nil
+}
+
 func (d *DB) GetAgent(name string) (*models.Agent, error) {
 	var a models.Agent
 	err := d.conn.QueryRow(

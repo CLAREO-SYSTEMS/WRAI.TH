@@ -60,6 +60,34 @@ func timeAgo(rfc3339 string) string {
 	}
 }
 
+// StaleThreshold is the duration after which an agent is considered offline.
+const StaleThreshold = 5 * time.Minute
+
+// isOnline returns true if the agent's last_seen is within the stale threshold.
+func isOnline(rfc3339 string) bool {
+	t, err := time.Parse(time.RFC3339, rfc3339)
+	if err != nil {
+		t, err = time.Parse("2006-01-02T15:04:05.000000Z", rfc3339)
+		if err != nil {
+			return false
+		}
+	}
+	return time.Since(t) < StaleThreshold
+}
+
+func statusIndicator(rfc3339 string) string {
+	if isOnline(rfc3339) {
+		if isTTY {
+			return "\033[32m●\033[0m" // green dot
+		}
+		return "online"
+	}
+	if isTTY {
+		return "\033[90m○\033[0m" // dim circle
+	}
+	return "offline"
+}
+
 // truncate shortens a string to n characters, adding "..." if truncated.
 func truncate(s string, n int) string {
 	if len(s) <= n {

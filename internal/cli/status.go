@@ -9,7 +9,6 @@ import (
 )
 
 func runStatus() {
-	// Check if relay is listening.
 	port := "8090"
 	if v := os.Getenv("PORT"); v != "" {
 		port = v
@@ -23,7 +22,6 @@ func runStatus() {
 		fmt.Printf("relay: %s\n", "stopped")
 	}
 
-	// Try to open DB for stats.
 	d, err := openDBSafe()
 	if err != nil {
 		fmt.Println("db: not found")
@@ -37,16 +35,27 @@ func runStatus() {
 		return
 	}
 
-	// Agents line with names.
 	agents, _ := d.ListAgents()
 	if len(agents) > 0 {
-		names := make([]string, len(agents))
-		for i, a := range agents {
-			names[i] = a.Name
+		var online, offline []string
+		for _, a := range agents {
+			if isOnline(a.LastSeen) {
+				online = append(online, a.Name)
+			} else {
+				offline = append(offline, a.Name)
+			}
 		}
-		fmt.Printf("agents: %d (%s)\n", stats.Agents, strings.Join(names, ", "))
+
+		parts := []string{}
+		if len(online) > 0 {
+			parts = append(parts, fmt.Sprintf("%d online (%s)", len(online), strings.Join(online, ", ")))
+		}
+		if len(offline) > 0 {
+			parts = append(parts, fmt.Sprintf("%d offline", len(offline)))
+		}
+		fmt.Printf("agents: %s\n", strings.Join(parts, ", "))
 	} else {
-		fmt.Printf("agents: %d\n", stats.Agents)
+		fmt.Printf("agents: 0\n")
 	}
 
 	fmt.Printf("unread: %d messages\n", stats.Unread)

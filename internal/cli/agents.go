@@ -17,9 +17,14 @@ func runAgents() {
 		return
 	}
 
-	rows := [][]string{{"NAME", "ROLE", "LAST SEEN"}}
+	rows := [][]string{{"", "NAME", "ROLE", "LAST SEEN"}}
 	for _, a := range agents {
-		rows = append(rows, []string{a.Name, truncate(a.Role, 30), timeAgo(a.LastSeen)})
+		rows = append(rows, []string{
+			statusIndicator(a.LastSeen),
+			a.Name,
+			truncate(a.Role, 30),
+			timeAgo(a.LastSeen),
+		})
 	}
 	printTable(rows)
 }

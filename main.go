@@ -61,6 +61,10 @@ func startServer() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Start stale agent cleanup goroutine.
+	cleanupDone := make(chan struct{})
+	relay.StartCleanup(database, cleanupDone)
+
 	go func() {
 		log.Printf("listening on %s", addr)
 		if err := r.HTTP.Start(addr); err != nil {
@@ -69,6 +73,7 @@ func startServer() {
 	}()
 
 	<-ctx.Done()
+	close(cleanupDone)
 	log.Println("shutting down...")
 	if err := r.HTTP.Shutdown(context.Background()); err != nil {
 		log.Printf("shutdown error: %v", err)
