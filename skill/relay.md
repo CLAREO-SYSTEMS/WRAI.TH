@@ -7,20 +7,20 @@ Before doing anything, check if the `agent-relay` MCP server is available (i.e. 
 **If the tools are NOT available**, the relay MCP server is not configured for this project. Fix it automatically:
 
 1. Read the project's `.mcp.json` file (in the project root). If it doesn't exist, create it.
-2. Derive the agent name from the project directory name (lowercase, hyphens instead of spaces). For example: `brandos-api` → `brandos-api`, `my-frontend` → `my-frontend`.
-3. Use the directory name as the **project** parameter too (same value as agent name, unless the user specifies otherwise).
+2. Derive the **project** name from the directory name (lowercase, hyphens). For example: `brandos-api` → `brandos-api`.
+3. Do NOT put an `?agent=` in the URL — agent identity is chosen per session via `register_agent`.
 4. Add (or merge into) the `.mcp.json`:
    ```json
    {
      "mcpServers": {
        "agent-relay": {
          "type": "http",
-         "url": "http://localhost:8090/mcp?agent=<derived-name>&project=<derived-name>"
+         "url": "http://localhost:8090/mcp?project=<derived-project>"
        }
      }
    }
    ```
-5. Tell the user: "Added agent-relay to `.mcp.json` as `<derived-name>` in project `<derived-name>`. Restart Claude Code (or run `/mcp`) to connect."
+5. Tell the user: "Added agent-relay to `.mcp.json` for project `<derived-project>`. Restart Claude Code (or run `/mcp`) to connect."
 6. Stop here — the tools won't be available until the MCP server is loaded.
 
 **If the tools ARE available**, proceed to the commands below.
@@ -37,19 +37,21 @@ The project name is typically the directory name of the codebase (e.g., `brandos
 
 ## Your Identity
 
-Extract your agent name from the MCP server URL in the project's `.mcp.json` file (the `?agent=` query parameter). If you can't determine it, ask the user.
+Your agent name is NOT in the URL — multiple sessions share the same `.mcp.json`. Instead:
 
-### Multi-agent mode (`as` parameter)
+1. On first `/relay` invocation, ask the user what agent name to use (e.g., "cto", "backend", "tech-lead"), or infer from the project context and your CLAUDE.md role.
+2. Call `register_agent(name: "<chosen-name>")` to claim your identity for this session.
+3. Use the `as: "<chosen-name>"` parameter on ALL subsequent tool calls (`send_message`, `get_inbox`, `list_conversations`, `mark_read`, etc.).
 
-All identity-aware tools accept an optional `as` parameter that overrides the default `?agent=` identity from the URL. This lets a single MCP connection manage multiple agents:
+This lets multiple Claude Code sessions run in the same directory, each with a different agent name.
+
+### Example
 
 ```
-send_message(as: "cto", to: "backend", subject: "...", content: "...")
-get_inbox(as: "frontend")
-list_conversations(as: "tech-lead")
+register_agent(name: "backend", role: "FastAPI developer", reports_to: "tech-lead")
+send_message(as: "backend", to: "frontend", subject: "...", content: "...")
+get_inbox(as: "backend")
 ```
-
-Use `as` when the user asks you to act as a different agent than the default one configured in `.mcp.json`. The `?agent=` in the URL serves as the fallback identity when `as` is not specified.
 
 ## Agent Hierarchy
 

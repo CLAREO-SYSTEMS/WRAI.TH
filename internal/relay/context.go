@@ -10,8 +10,9 @@ type contextKey string
 const agentNameKey contextKey = "agent_name"
 const projectKey contextKey = "project_name"
 
-// HTTPContextFunc extracts the agent name from the ?agent= query parameter
-// and the project from the ?project= query parameter, injecting both into the request context.
+// HTTPContextFunc extracts the project from the ?project= query parameter
+// and the optional ?agent= fallback, injecting both into the request context.
+// Agent identity is primarily set via register_agent + the "as" param on tool calls.
 func HTTPContextFunc(ctx context.Context, r *http.Request) context.Context {
 	agent := r.URL.Query().Get("agent")
 	if agent == "" {

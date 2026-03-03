@@ -261,7 +261,7 @@ You are an inter-agent communication assistant using the Agent Relay MCP server.
 
 ## Your Identity
 
-Extract your agent name from the MCP server URL in the project's ``.mcp.json`` file (the ``?agent=`` query parameter). If you can't determine it, ask the user.
+Your agent name is NOT in the URL. On first invocation, ask the user or infer from context, then register with ``register_agent``. Use ``as`` on all calls.
 
 ## Commands
 
@@ -326,7 +326,7 @@ function Find-AndConfigureProjects {
 
     if ($projects.Count -eq 0) {
         Write-Info "No Claude Code projects found"
-        Write-Info "Manually add to .mcp.json: {`"mcpServers`":{`"agent-relay`":{`"type`":`"http`",`"url`":`"http://localhost:${Port}/mcp?agent=NAME`"}}}"
+        Write-Info "Manually add to .mcp.json: {`"mcpServers`":{`"agent-relay`":{`"type`":`"http`",`"url`":`"http://localhost:${Port}/mcp?project=my-project`"}}}"
         return
     }
 
@@ -367,7 +367,8 @@ function Find-AndConfigureProjects {
 
 function Set-ProjectConfig($projectDir, $agentName) {
     $mcpPath = Join-Path $projectDir ".mcp.json"
-    $relayEntry = @{ type = "http"; url = "http://localhost:$Port/mcp?agent=$agentName" }
+    $projectName = (Split-Path $projectDir -Leaf).ToLower() -replace '[^a-z0-9]', '-' -replace '-+', '-' -replace '^-|-$', ''
+    $relayEntry = @{ type = "http"; url = "http://localhost:$Port/mcp?project=$projectName" }
 
     if (Test-Path $mcpPath) {
         $content = Get-Content $mcpPath -Raw

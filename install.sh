@@ -527,7 +527,7 @@ You are an inter-agent communication assistant using the Agent Relay MCP server.
 
 ## Your Identity
 
-Extract your agent name from the MCP server URL in the project's `.mcp.json` file (the `?agent=` query parameter). If you can't determine it, ask the user.
+Your agent name is NOT in the URL. On first invocation, ask the user or infer from context, then register with `register_agent`. Use `as` on all calls.
 
 ## Commands
 
@@ -545,11 +545,16 @@ Parse the user's arguments from `$ARGUMENTS`:
 - **`invite <conversation_id> <agent>`**: Invite an agent to a conversation
 - **`talk`**: Enter conversation mode (proactive loop)
 
+## Your Identity
+
+Your agent name is NOT in the URL. On first invocation, ask the user what name to use (or infer from context), then call `register_agent(name: "<chosen>")`. Use `as: "<chosen>"` on all subsequent tool calls.
+
 ## Behavior
 
 ### On first invocation
-1. Call `register_agent` with your agent name, role (based on the project), a brief description of current work, and optionally `reports_to` (the name of the agent you report to in the org hierarchy)
-2. Then execute the requested command
+1. Choose an agent name (ask user or infer from project role)
+2. Call `register_agent` with the name, role, description, and optionally `reports_to`
+3. Then execute the requested command
 
 ### Checking inbox (default)
 1. Call `get_inbox` with `unread_only: true`
@@ -633,7 +638,7 @@ scan_and_configure_projects() {
     info "No Claude Code projects found"
     info "You can manually add relay to any project's ${BOLD}.mcp.json${RESET} later:"
     echo
-    echo "  ${DIM}{\"mcpServers\": {\"agent-relay\": {\"type\": \"http\", \"url\": \"http://localhost:${PORT}/mcp?agent=myagent\"}}}${RESET}"
+    echo "  ${DIM}{\"mcpServers\": {\"agent-relay\": {\"type\": \"http\", \"url\": \"http://localhost:${PORT}/mcp?project=my-project\"}}}${RESET}"
     return 0
   fi
 
@@ -722,7 +727,9 @@ configure_project() {
   local agent_name="$2"
   local mcp_path="${project_dir}/.mcp.json"
 
-  local relay_entry="{\"type\":\"http\",\"url\":\"http://localhost:${PORT}/mcp?agent=${agent_name}\"}"
+  local project_name
+  project_name=$(echo "$(basename "$project_dir")" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/--*/-/g; s/^-//; s/-$//')
+  local relay_entry="{\"type\":\"http\",\"url\":\"http://localhost:${PORT}/mcp?project=${project_name}\"}"
 
   if [[ -f "$mcp_path" ]]; then
     # Check if already configured
@@ -846,7 +853,7 @@ print_summary() {
   info "CLI shortcut: ${BOLD}ar serve${RESET}, ${BOLD}ar status${RESET}, ${BOLD}ar agents${RESET} (alias for agent-relay)"
   echo
   info "Add relay to more projects by adding to ${BOLD}.mcp.json${RESET}:"
-  echo "  ${DIM}{\"mcpServers\": {\"agent-relay\": {\"type\": \"http\", \"url\": \"http://localhost:${PORT}/mcp?agent=NAME\"}}}${RESET}"
+  echo "  ${DIM}{\"mcpServers\": {\"agent-relay\": {\"type\": \"http\", \"url\": \"http://localhost:${PORT}/mcp?project=my-project\"}}}${RESET}"
   echo
   info "Uninstall: ${DIM}curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash -s -- --uninstall${RESET}"
   echo

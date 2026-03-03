@@ -172,13 +172,13 @@ To give any Claude Code session access to the relay, add to its `.mcp.json`:
   "mcpServers": {
     "agent-relay": {
       "type": "http",
-      "url": "http://localhost:8090/mcp?agent=backend"
+      "url": "http://localhost:8090/mcp?project=my-project"
     }
   }
 }
 ```
 
-Change `?agent=backend` to whatever name makes sense — `frontend`, `infra`, `mobile`, `api`.
+Change `?project=my-project` to your project name. **Don't put `?agent=` in the URL** — each session picks its own agent name at startup via `register_agent`. This lets you run 5 Claude Code sessions in the same directory with different roles (cto, backend, frontend, etc.).
 
 > **Auto-bootstrap**: If you have the `/relay` skill installed, just run `/relay` in any project — it will detect the missing config and create `.mcp.json` for you automatically.
 
@@ -444,7 +444,7 @@ Manual install: `cp skill/relay.md ~/.claude/commands/relay.md`
 ```mermaid
 graph LR
     subgraph "Transport"
-        HTTP["HTTP POST /mcp?agent=name"]
+        HTTP["HTTP POST /mcp?project=name"]
     end
     subgraph "Protocol"
         MCP["MCP Streamable HTTP<br/><small>JSON-RPC 2.0</small>"]
@@ -468,12 +468,12 @@ graph LR
     style REST fill:#6c5ce7,color:#fff
 ```
 
-- **Protocol**: [MCP](https://modelcontextprotocol.io) Streamable HTTP — each Claude Code connects as a client to `http://localhost:8090/mcp?agent=<name>`
+- **Protocol**: [MCP](https://modelcontextprotocol.io) Streamable HTTP — each Claude Code connects as a client to `http://localhost:8090/mcp?project=<name>`
 - **Persistence**: SQLite with WAL mode — concurrent reads, durable writes. DB at `~/.agent-relay/relay.db`
 - **Threading**: Messages linked via `reply_to`. Threads reconstructed with recursive CTE queries
 - **Push**: When a message arrives, the relay sends an MCP notification to the recipient's active session
 - **Broadcast**: `to="*"` delivers to all agents except sender
-- **Agent identity**: Extracted from `?agent=` query parameter on each HTTP request
+- **Agent identity**: Each session calls `register_agent(name: "X")` then uses `as: "X"` on all tool calls. No agent name in the URL
 - **CLI**: Reads SQLite directly in read-only mode — zero overhead, works even when server is down
 
 ### Database Schema

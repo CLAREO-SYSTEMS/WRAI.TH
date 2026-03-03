@@ -350,7 +350,7 @@ func resolveProject(ctx context.Context, req mcp.CallToolRequest) string {
 }
 
 // resolveAgent returns the agent name from the `as` parameter if set,
-// otherwise falls back to the ?agent= URL parameter from the connection.
+// otherwise falls back to the URL context (for backward compatibility).
 func resolveAgent(ctx context.Context, req mcp.CallToolRequest) string {
 	if as := req.GetString("as", ""); as != "" {
 		return as
