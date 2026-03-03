@@ -102,6 +102,8 @@ The CLI reads directly from SQLite — no running server needed for queries.
 curl -fsSL https://raw.githubusercontent.com/Synergix-lab/claude-agentic-relay/main/install.sh | bash
 ```
 
+> On macOS, the installer needs `sudo` to write to `/usr/local/bin`. If it fails, run `sudo install -m 755 ./agent-relay /usr/local/bin/agent-relay` manually.
+
 **Windows (PowerShell):**
 ```powershell
 irm https://raw.githubusercontent.com/Synergix-lab/claude-agentic-relay/main/install.ps1 | iex
