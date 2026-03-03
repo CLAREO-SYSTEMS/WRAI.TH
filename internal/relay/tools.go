@@ -115,6 +115,7 @@ func getConversationMessagesTool() mcp.Tool {
 		projectParam,
 		mcp.WithString("conversation_id", mcp.Description("The conversation ID"), mcp.Required()),
 		mcp.WithNumber("limit", mcp.Description("Max number of messages to return (default: 50)")),
+		mcp.WithString("format", mcp.Description("Response format: 'full' (default), 'compact' (metadata only: id, from, type, subject, timestamp), 'digest' (metadata + first 200 chars of content)")),
 	)
 }
 

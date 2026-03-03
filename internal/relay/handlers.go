@@ -287,10 +287,44 @@ func (h *Handlers) HandleGetConversationMessages(ctx context.Context, req mcp.Ca
 		messages = []models.Message{}
 	}
 
+	// Auto-mark conversation as read when fetching messages
+	_ = h.db.MarkConversationRead(convID, agent)
+
+	format := req.GetString("format", "full")
+
+	formatted := make([]map[string]any, len(messages))
+	for i, m := range messages {
+		entry := map[string]any{
+			"id":         m.ID,
+			"from":       m.From,
+			"type":       m.Type,
+			"subject":    m.Subject,
+			"created_at": m.CreatedAt,
+		}
+		if m.ReplyTo != nil {
+			entry["reply_to"] = *m.ReplyTo
+		}
+		switch format {
+		case "compact":
+			// metadata only — no content
+		case "digest":
+			c := m.Content
+			if len(c) > 200 {
+				c = c[:200] + "..."
+			}
+			entry["content"] = c
+		default: // "full"
+			entry["content"] = m.Content
+			entry["metadata"] = m.Metadata
+		}
+		formatted[i] = entry
+	}
+
 	return resultJSON(map[string]any{
 		"conversation_id": convID,
-		"count":           len(messages),
-		"messages":        messages,
+		"count":           len(formatted),
+		"format":          format,
+		"messages":        formatted,
 	})
 }
 

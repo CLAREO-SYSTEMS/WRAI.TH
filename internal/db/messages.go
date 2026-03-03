@@ -135,6 +135,31 @@ func (d *DB) MarkRead(messageIDs []string, agentName string) (int, error) {
 	}
 
 	n, _ := result.RowsAffected()
+
+	// Also update conversation_reads for any conversation messages just marked
+	convPlaceholders := ""
+	convArgs := make([]any, 0, len(messageIDs))
+	for i, id := range messageIDs {
+		if i > 0 {
+			convPlaceholders += ","
+		}
+		convPlaceholders += "?"
+		convArgs = append(convArgs, id)
+	}
+	convRows, err := d.conn.Query(
+		fmt.Sprintf("SELECT DISTINCT conversation_id FROM messages WHERE id IN (%s) AND conversation_id IS NOT NULL", convPlaceholders),
+		convArgs...,
+	)
+	if err == nil {
+		defer convRows.Close()
+		for convRows.Next() {
+			var convID string
+			if err := convRows.Scan(&convID); err == nil {
+				_ = d.MarkConversationRead(convID, agentName)
+			}
+		}
+	}
+
 	return int(n), nil
 }
 
