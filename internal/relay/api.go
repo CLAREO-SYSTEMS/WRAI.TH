@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"agent-relay/internal/db"
+	"agent-relay/internal/ingest"
 	"agent-relay/internal/models"
 )
 
@@ -53,6 +54,8 @@ func (r *Relay) ServeAPI(w http.ResponseWriter, req *http.Request) {
 		r.apiResolveMemoryConflict(w, req, path)
 	case strings.HasPrefix(path, "/memories/") && req.Method == http.MethodDelete:
 		r.apiDeleteMemory(w, path)
+	case path == "/activity" && req.Method == http.MethodGet:
+		r.apiGetActivity(w)
 	default:
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 	}
@@ -498,6 +501,18 @@ func (r *Relay) apiResolveMemoryConflict(w http.ResponseWriter, req *http.Reques
 		return
 	}
 	writeJSON(w, map[string]any{"resolved": true, "memory": mem})
+}
+
+func (r *Relay) apiGetActivity(w http.ResponseWriter) {
+	if r.Ingester == nil {
+		writeJSON(w, []any{})
+		return
+	}
+	sessions := r.Ingester.GetSessions()
+	if sessions == nil {
+		sessions = make([]ingest.SessionState, 0)
+	}
+	writeJSON(w, sessions)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

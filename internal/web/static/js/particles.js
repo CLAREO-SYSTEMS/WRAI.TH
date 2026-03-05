@@ -82,6 +82,22 @@ export class ParticleEmitter {
     }
   }
 
+  emitActivity(x, y, color) {
+    for (let i = 0; i < 6; i++) {
+      const angle = (Math.PI * 2 * i) / 6;
+      const speed = 25 + Math.random() * 25;
+      this.particles.push(
+        new Particle(
+          x, y, color,
+          Math.cos(angle) * speed,
+          Math.sin(angle) * speed - 15,
+          0.5 + Math.random() * 0.3,
+          1.5 + Math.random() * 1.5
+        )
+      );
+    }
+  }
+
   update(dt) {
     for (let i = this.particles.length - 1; i >= 0; i--) {
       this.particles[i].update(dt);

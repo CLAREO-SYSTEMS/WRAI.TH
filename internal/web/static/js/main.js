@@ -3,6 +3,7 @@ import { WorldBackground, World } from "./world.js";
 import { AgentView } from "./agent-view.js";
 import { APIClient } from "./api-client.js";
 import { MessageOrb } from "./message-orb.js";
+import { ACTIVITY_GLOW } from "./sprite.js";
 
 // --- Composite key for cross-project agent identity ---
 function agentKey(project, name) {
@@ -39,6 +40,7 @@ let focusedAgent = null;            // "project:name" of focused agent, or null
 let focusedProject = null;          // project name when zoomed into a cluster, or null
 let paletteCounter = 0;
 let agentsData = [];                // cached raw agent data for hierarchy
+let activitySessions = [];          // cached activity data from ingester
 let connected = false;
 let firstLayout = true;
 
@@ -249,6 +251,55 @@ function onAgents(agents) {
   layoutAgents();
   updateHighlights();
   updateHierarchyLinks();
+}
+
+function onActivity(sessions) {
+  activitySessions = sessions;
+
+  // Merge activity into agentViews
+  // V1: show sessions as overlay on agents matching by session_id suffix or as standalone
+  // For now, try to match session_id to any agentView (best-effort)
+  // Reset all activities first
+  for (const [, av] of agentViews) {
+    av.activity = null;
+    av.activityTool = "";
+    av.activityFile = "";
+  }
+
+  // Map sessions to agents — for V1, distribute sessions to agents in order
+  // TODO phase 2: proper session_id → agent_name mapping
+  const agentList = [...agentViews.values()];
+  for (let i = 0; i < sessions.length; i++) {
+    const s = sessions[i];
+    // Try to match by agent name embedded in session_id or just assign by index
+    let matched = false;
+    for (const [, av] of agentViews) {
+      if (s.session_id && s.session_id.includes(av.name)) {
+        const prevActivity = av.activity;
+        av.activity = s.activity || null;
+        av.activityTool = s.tool || "";
+        av.activityFile = s.file || "";
+        // Particle burst on activity transition
+        if (prevActivity !== av.activity && av.activity && av.activity !== "idle") {
+          const glowColor = ACTIVITY_GLOW[av.activity];
+          if (glowColor) av.particles.emitActivity(av.x, av.y + 24, glowColor);
+        }
+        matched = true;
+        break;
+      }
+    }
+    if (!matched && i < agentList.length) {
+      const av = agentList[i];
+      const prevActivity = av.activity;
+      av.activity = s.activity || null;
+      av.activityTool = s.tool || "";
+      av.activityFile = s.file || "";
+      if (prevActivity !== av.activity && av.activity && av.activity !== "idle") {
+        const glowColor = ACTIVITY_GLOW[av.activity];
+        if (glowColor) av.particles.emitActivity(av.x, av.y + 24, glowColor);
+      }
+    }
+  }
 }
 
 function onConversations(convs) {
@@ -843,7 +894,7 @@ setInterval(() => {
 // --- Start ---
 
 console.log("[relay] UI initializing...");
-const client = new APIClient(onAgents, onConversations, onNewMessages);
+const client = new APIClient(onAgents, onConversations, onNewMessages, onActivity);
 client.start();
 loadMessages();
 console.log("[relay] polling started");

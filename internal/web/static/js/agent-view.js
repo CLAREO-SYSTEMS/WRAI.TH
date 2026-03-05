@@ -1,4 +1,4 @@
-import { SpriteGenerator, PALETTE_COLORS } from "./sprite.js";
+import { SpriteGenerator, PALETTE_COLORS, ACTIVITY_GLOW, ACTIVITY_FRAME_SPEED } from "./sprite.js";
 import { Bubble } from "./bubble.js";
 import { ParticleEmitter } from "./particles.js";
 
@@ -26,6 +26,12 @@ export class AgentView {
     this.color = PALETTE_COLORS[paletteIndex % PALETTE_COLORS.length];
     this.bubble = null;
     this.particles = new ParticleEmitter();
+
+    // Activity state (from ingester)
+    this.activity = null;    // "typing", "reading", "terminal", "browsing", "waiting", "idle", null
+    this.activityTool = "";
+    this.activityFile = "";
+    this._waitPulse = 0;
   }
 
   setPosition(x, y) {
@@ -58,11 +64,17 @@ export class AgentView {
       if (this.spawnAlpha >= 1) this.spawning = false;
     }
 
-    // Animation frames
+    // Animation frames (speed based on activity)
+    const frameSpeed = this.activity ? (ACTIVITY_FRAME_SPEED[this.activity] || 0.5) : 0.5;
     this.frameTimer += dt;
-    if (this.frameTimer > 0.5) {
+    if (this.frameTimer > frameSpeed) {
       this.frameTimer = 0;
       this.frameIndex = (this.frameIndex + 1) % this.frames.length;
+    }
+
+    // Waiting pulse
+    if (this.activity === "waiting") {
+      this._waitPulse += dt * 4;
     }
 
     // Bubble
@@ -81,6 +93,26 @@ export class AgentView {
 
     ctx.save();
     ctx.globalAlpha = dimmed ? alpha * 0.3 : alpha;
+
+    // Activity glow
+    const glowColor = this.activity ? ACTIVITY_GLOW[this.activity] : null;
+    if (glowColor) {
+      let glowAlpha = 0.5;
+      let glowSize = 8;
+      if (this.activity === "waiting") {
+        glowAlpha = 0.3 + 0.3 * Math.abs(Math.sin(this._waitPulse));
+        glowSize = 10 + 4 * Math.abs(Math.sin(this._waitPulse));
+      }
+      ctx.shadowColor = glowColor;
+      ctx.shadowBlur = glowSize;
+      ctx.globalAlpha *= glowAlpha;
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, 26, 0, Math.PI * 2);
+      ctx.fillStyle = glowColor;
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.globalAlpha = dimmed ? alpha * 0.3 : alpha;
+    }
 
     // Draw sprite
     const frame = this.frames[this.frameIndex];
@@ -121,10 +153,27 @@ export class AgentView {
     }
 
     // Project tag (below role, only when multiple projects exist)
+    let nextY = this.y + 48;
     if (this.showProjectTag && this.project) {
+      nextY += 10;
       ctx.font = "8px 'JetBrains Mono', monospace";
       ctx.fillStyle = "rgba(108, 92, 231, 0.45)";
-      ctx.fillText(this.project, this.x, this.y + 58);
+      ctx.fillText(this.project, this.x, nextY);
+    }
+
+    // Activity label
+    if (this.activity && this.activity !== "idle") {
+      nextY += 11;
+      ctx.font = "8px 'JetBrains Mono', monospace";
+      ctx.fillStyle = glowColor || "rgba(224,224,232,0.5)";
+      let label = this.activity;
+      if (this.activityFile) {
+        const short = this.activityFile.split("/").pop();
+        label += " " + (short.length > 20 ? short.slice(0, 18) + ".." : short);
+      } else if (this.activityTool) {
+        label += " " + this.activityTool;
+      }
+      ctx.fillText(label, this.x, nextY);
     }
 
     ctx.restore();

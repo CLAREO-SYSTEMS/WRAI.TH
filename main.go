@@ -10,6 +10,7 @@ import (
 
 	"agent-relay/internal/cli"
 	"agent-relay/internal/db"
+	"agent-relay/internal/ingest"
 	"agent-relay/internal/relay"
 )
 
@@ -51,7 +52,13 @@ func startServer() {
 	}
 	defer database.Close()
 
-	r := relay.New(database)
+	ingester, err := ingest.New(ingest.Config{})
+	if err != nil {
+		log.Fatalf("failed to init ingester: %v", err)
+	}
+	defer ingester.Stop()
+
+	r := relay.New(database, ingester)
 
 	addr := ":8090"
 	if v := os.Getenv("PORT"); v != "" {
@@ -64,6 +71,13 @@ func startServer() {
 	// Start stale agent cleanup goroutine.
 	cleanupDone := make(chan struct{})
 	relay.StartCleanup(database, cleanupDone)
+
+	// Log ingested events (phase 1: log only, phase 2: TouchAgent + WS broadcast)
+	go func() {
+		for evt := range ingester.Events {
+			log.Printf("[ingest] %s session=%s tool=%s activity=%s", evt.Type, evt.SessionID, evt.Tool, evt.Activity)
+		}
+	}()
 
 	go func() {
 		log.Printf("listening on %s (UI: http://localhost%s)", addr, addr)

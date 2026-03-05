@@ -1,13 +1,15 @@
 export class APIClient {
-  constructor(onAgents, onConversations, onNewMessages) {
+  constructor(onAgents, onConversations, onNewMessages, onActivity) {
     this.onAgents = onAgents;
     this.onConversations = onConversations;
     this.onNewMessages = onNewMessages;
+    this.onActivity = onActivity;
 
     this._lastMessageTime = null;
     this._agentTimer = null;
     this._msgTimer = null;
     this._convTimer = null;
+    this._activityTimer = null;
     this._running = false;
   }
 
@@ -26,6 +28,10 @@ export class APIClient {
 
     // Poll new messages every 2s
     this._msgTimer = setInterval(() => this.fetchLatestMessagesAllProjects(), 2000);
+
+    // Poll activity every 2s
+    this.fetchActivity();
+    this._activityTimer = setInterval(() => this.fetchActivity(), 2000);
   }
 
   stop() {
@@ -33,6 +39,7 @@ export class APIClient {
     clearInterval(this._agentTimer);
     clearInterval(this._msgTimer);
     clearInterval(this._convTimer);
+    clearInterval(this._activityTimer);
   }
 
   async fetchAllAgents() {
@@ -103,6 +110,17 @@ export class APIClient {
       return res.ok;
     } catch {
       return false;
+    }
+  }
+
+  async fetchActivity() {
+    try {
+      const res = await fetch("/api/activity");
+      if (!res.ok) return;
+      const sessions = await res.json();
+      if (this.onActivity) this.onActivity(sessions);
+    } catch {
+      // Silently ignore
     }
   }
 

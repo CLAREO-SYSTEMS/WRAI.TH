@@ -75,6 +75,26 @@ const PALETTES = [
 // Palette color for name tags (matches the coat color)
 export const PALETTE_COLORS = PALETTES.map(p => p.C);
 
+// Activity → glow color mapping
+export const ACTIVITY_GLOW = {
+  typing:   "#00e676",
+  reading:  "#00bcd4",
+  terminal: "#ff9800",
+  browsing: "#aa00ff",
+  waiting:  "#ff1744",
+  idle:     null,
+};
+
+// Activity → frame speed (seconds per frame)
+export const ACTIVITY_FRAME_SPEED = {
+  typing:   0.2,
+  reading:  0.4,
+  terminal: 0.3,
+  browsing: 0.35,
+  waiting:  1.2,
+  idle:     0.6,
+};
+
 const cache = new Map();
 
 export class SpriteGenerator {

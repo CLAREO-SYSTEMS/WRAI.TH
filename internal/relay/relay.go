@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"agent-relay/internal/db"
+	"agent-relay/internal/ingest"
 	"agent-relay/internal/web"
 
 	"github.com/mark3labs/mcp-go/server"
@@ -18,11 +19,12 @@ type Relay struct {
 	HTTP       *server.StreamableHTTPServer
 	DB         *db.DB
 	Registry   *SessionRegistry
+	Ingester   *ingest.Ingester
 	httpServer *http.Server
 }
 
 // New creates a fully wired Relay with all tools registered.
-func New(database *db.DB) *Relay {
+func New(database *db.DB, ingester *ingest.Ingester) *Relay {
 	mcpSrv := server.NewMCPServer(
 		"agent-relay",
 		"1.0.0",
@@ -67,6 +69,7 @@ func New(database *db.DB) *Relay {
 		HTTP:      httpSrv,
 		DB:        database,
 		Registry:  registry,
+		Ingester:  ingester,
 	}
 }
 
