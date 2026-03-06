@@ -7,10 +7,11 @@ import (
 )
 
 const (
-	waitingThreshold = 10 * time.Second
-	idleThreshold    = 30 * time.Second
-	exitThreshold    = 5 * time.Minute
-	tickInterval     = 5 * time.Second
+	waitingThreshold  = 10 * time.Second
+	idleThreshold     = 30 * time.Second
+	exitThreshold     = 5 * time.Minute
+	tickInterval      = 2 * time.Second
+	minDisplayTime    = 1500 * time.Millisecond // activity visible for at least 1.5s
 )
 
 type SessionState struct {
@@ -23,27 +24,82 @@ type SessionState struct {
 }
 
 type sessionEntry struct {
-	lastEvent time.Time
-	lastType  EventType
-	tool      string
-	file      string
-	activity  Activity
-	state     string
-	idleSent  bool
-	waitSent  bool
+	lastEvent    time.Time
+	lastType     EventType
+	tool         string
+	file         string
+	activity     Activity
+	state        string
+	idleSent     bool
+	waitSent     bool
+	displayUntil time.Time // activity stays visible until this time
+	pendingType  EventType // deferred event waiting for display to expire
+	pendingAct   Activity
 }
 
 type Detector struct {
-	mu       sync.RWMutex
-	sessions map[string]*sessionEntry
-	out      chan<- AgentEvent
+	mu          sync.RWMutex
+	sessions    map[string]*sessionEntry
+	out         chan<- AgentEvent
+	subMu       sync.RWMutex
+	subscribers map[chan []SessionState]struct{}
 }
 
 func newDetector(out chan<- AgentEvent) *Detector {
 	return &Detector{
-		sessions: make(map[string]*sessionEntry),
-		out:      out,
+		sessions:    make(map[string]*sessionEntry),
+		out:         out,
+		subscribers: make(map[chan []SessionState]struct{}),
 	}
+}
+
+// Subscribe returns a channel that receives session state snapshots on every change.
+func (d *Detector) Subscribe() chan []SessionState {
+	ch := make(chan []SessionState, 8)
+	d.subMu.Lock()
+	d.subscribers[ch] = struct{}{}
+	d.subMu.Unlock()
+	return ch
+}
+
+// Unsubscribe removes a subscriber channel.
+func (d *Detector) Unsubscribe(ch chan []SessionState) {
+	d.subMu.Lock()
+	delete(d.subscribers, ch)
+	d.subMu.Unlock()
+	close(ch)
+}
+
+// broadcast sends current state to all SSE subscribers (non-blocking).
+func (d *Detector) broadcast() {
+	d.subMu.RLock()
+	defer d.subMu.RUnlock()
+	if len(d.subscribers) == 0 {
+		return
+	}
+	snap := d.getSessionsLocked()
+	for ch := range d.subscribers {
+		select {
+		case ch <- snap:
+		default:
+			// subscriber too slow, skip
+		}
+	}
+}
+
+func (d *Detector) getSessionsLocked() []SessionState {
+	result := make([]SessionState, 0, len(d.sessions))
+	for sid, s := range d.sessions {
+		result = append(result, SessionState{
+			SessionID: sid,
+			Activity:  s.activity,
+			Tool:      s.tool,
+			File:      s.file,
+			LastEvent: s.lastEvent,
+			State:     s.state,
+		})
+	}
+	return result
 }
 
 func (d *Detector) RecordEvent(evt AgentEvent) {
@@ -58,12 +114,39 @@ func (d *Detector) RecordEvent(evt AgentEvent) {
 
 	s.lastEvent = evt.Timestamp
 	s.lastType = evt.Type
-	s.tool = evt.Tool
 	s.file = evt.File
-	s.activity = evt.Activity
-	s.state = "active"
 	s.idleSent = false
 	s.waitSent = false
+
+	now := time.Now()
+
+	if evt.Type == EventStop {
+		// Agent turn ended → waiting for user input (always immediate)
+		s.tool = ""
+		s.activity = ActivityWaiting
+		s.state = "waiting"
+		s.displayUntil = time.Time{}
+		s.pendingType = ""
+	} else if evt.Type == EventToolEnd {
+		// Tool finished — but keep current activity visible for minDisplayTime
+		if now.Before(s.displayUntil) {
+			s.pendingType = EventToolEnd
+			s.pendingAct = ActivityThinking
+		} else {
+			s.tool = ""
+			s.activity = ActivityThinking
+			s.state = "thinking"
+		}
+	} else {
+		// tool_start — new activity always wins, set minimum display
+		s.tool = evt.Tool
+		s.activity = evt.Activity
+		s.state = "active"
+		s.displayUntil = now.Add(minDisplayTime)
+		s.pendingType = ""
+	}
+
+	d.broadcast()
 }
 
 func (d *Detector) GetSessions() []SessionState {
@@ -105,6 +188,14 @@ func (d *Detector) tick(now time.Time) {
 	for sid, s := range d.sessions {
 		elapsed := now.Sub(s.lastEvent)
 
+		// Flush pending transitions when display time expires
+		if s.pendingType != "" && now.After(s.displayUntil) {
+			s.tool = ""
+			s.activity = s.pendingAct
+			s.state = "thinking"
+			s.pendingType = ""
+		}
+
 		if elapsed > exitThreshold {
 			if s.state != "exited" {
 				s.state = "exited"
@@ -145,4 +236,6 @@ func (d *Detector) tick(now time.Time) {
 			}
 		}
 	}
+
+	d.broadcast()
 }

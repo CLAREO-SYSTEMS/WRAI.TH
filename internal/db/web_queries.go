@@ -55,7 +55,7 @@ func (d *DB) GetAllRecentMessages(project string, limit int) ([]models.Message, 
 	}
 
 	query := `
-		SELECT id, from_agent, to_agent, reply_to, type, subject, content, metadata, created_at, read_at, conversation_id, project
+		SELECT id, from_agent, to_agent, reply_to, type, subject, content, metadata, created_at, read_at, conversation_id, project, task_id
 		FROM messages
 		WHERE project = ?
 		ORDER BY created_at ASC
@@ -71,7 +71,7 @@ func (d *DB) GetMessagesSince(project, since string, limit int) ([]models.Messag
 	}
 
 	query := `
-		SELECT id, from_agent, to_agent, reply_to, type, subject, content, metadata, created_at, read_at, conversation_id, project
+		SELECT id, from_agent, to_agent, reply_to, type, subject, content, metadata, created_at, read_at, conversation_id, project, task_id
 		FROM messages
 		WHERE project = ? AND created_at > ?
 		ORDER BY created_at ASC
@@ -82,7 +82,7 @@ func (d *DB) GetMessagesSince(project, since string, limit int) ([]models.Messag
 
 // ListAllAgents returns all agents across all projects, ordered by project then name.
 func (d *DB) ListAllAgents() ([]models.Agent, error) {
-	rows, err := d.conn.Query("SELECT id, name, role, description, registered_at, last_seen, project, reports_to FROM agents ORDER BY project, name")
+	rows, err := d.conn.Query("SELECT "+agentColumns+" FROM agents WHERE status IN ('active', 'sleeping', 'inactive') ORDER BY project, name")
 	if err != nil {
 		return nil, fmt.Errorf("list all agents: %w", err)
 	}
@@ -90,8 +90,8 @@ func (d *DB) ListAllAgents() ([]models.Agent, error) {
 
 	var agents []models.Agent
 	for rows.Next() {
-		var a models.Agent
-		if err := rows.Scan(&a.ID, &a.Name, &a.Role, &a.Description, &a.RegisteredAt, &a.LastSeen, &a.Project, &a.ReportsTo); err != nil {
+		a, err := scanAgent(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan agent: %w", err)
 		}
 		agents = append(agents, a)
@@ -106,7 +106,7 @@ func (d *DB) GetAllRecentMessagesAllProjects(limit int) ([]models.Message, error
 	}
 
 	query := `
-		SELECT id, from_agent, to_agent, reply_to, type, subject, content, metadata, created_at, read_at, conversation_id, project
+		SELECT id, from_agent, to_agent, reply_to, type, subject, content, metadata, created_at, read_at, conversation_id, project, task_id
 		FROM messages
 		ORDER BY created_at ASC
 		LIMIT ?
@@ -121,7 +121,7 @@ func (d *DB) GetMessagesSinceAllProjects(since string, limit int) ([]models.Mess
 	}
 
 	query := `
-		SELECT id, from_agent, to_agent, reply_to, type, subject, content, metadata, created_at, read_at, conversation_id, project
+		SELECT id, from_agent, to_agent, reply_to, type, subject, content, metadata, created_at, read_at, conversation_id, project, task_id
 		FROM messages
 		WHERE created_at > ?
 		ORDER BY created_at ASC

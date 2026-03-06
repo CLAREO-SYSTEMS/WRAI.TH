@@ -15,13 +15,16 @@ const memoryTimeFmt = "2006-01-02T15:04:05.000000Z"
 
 // SetMemory creates or versions a memory. If the key already exists at the same
 // scope with a different value, a conflict is flagged instead of overwriting.
-func (d *DB) SetMemory(project, agentName, key, value, tagsJSON, scope, confidence string) (*models.Memory, error) {
+func (d *DB) SetMemory(project, agentName, key, value, tagsJSON, scope, confidence, layer string) (*models.Memory, error) {
 	now := time.Now().UTC().Format(memoryTimeFmt)
 	if confidence == "" {
 		confidence = "stated"
 	}
 	if tagsJSON == "" {
 		tagsJSON = "[]"
+	}
+	if layer == "" {
+		layer = "behavior"
 	}
 
 	// Find existing active memory at this scope+key
@@ -63,14 +66,15 @@ func (d *DB) SetMemory(project, agentName, key, value, tagsJSON, scope, confiden
 			ConflictWith: &existing.ID,
 			CreatedAt:    now,
 			UpdatedAt:    now,
+			Layer:        layer,
 		}
 
 		_, err := d.conn.Exec(
-			`INSERT INTO memories (id, key, value, tags, scope, project, agent_name, confidence, version, supersedes, conflict_with, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO memories (id, key, value, tags, scope, project, agent_name, confidence, version, supersedes, conflict_with, created_at, updated_at, layer)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			mem.ID, mem.Key, mem.Value, mem.Tags, mem.Scope, mem.Project,
 			mem.AgentName, mem.Confidence, mem.Version, mem.Supersedes, mem.ConflictWith,
-			mem.CreatedAt, mem.UpdatedAt,
+			mem.CreatedAt, mem.UpdatedAt, mem.Layer,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("insert conflicting memory: %w", err)
@@ -91,13 +95,14 @@ func (d *DB) SetMemory(project, agentName, key, value, tagsJSON, scope, confiden
 		Version:    1,
 		CreatedAt:  now,
 		UpdatedAt:  now,
+		Layer:      layer,
 	}
 
 	_, err = d.conn.Exec(
-		`INSERT INTO memories (id, key, value, tags, scope, project, agent_name, confidence, version, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO memories (id, key, value, tags, scope, project, agent_name, confidence, version, created_at, updated_at, layer)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		mem.ID, mem.Key, mem.Value, mem.Tags, mem.Scope, mem.Project,
-		mem.AgentName, mem.Confidence, mem.Version, mem.CreatedAt, mem.UpdatedAt,
+		mem.AgentName, mem.Confidence, mem.Version, mem.CreatedAt, mem.UpdatedAt, mem.Layer,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("insert memory: %w", err)
@@ -132,19 +137,19 @@ func (d *DB) getMemoryAtScope(project, agentName, key, scope string) ([]models.M
 	switch scope {
 	case "agent":
 		query = `SELECT id, key, value, tags, scope, project, agent_name, confidence, version,
-				 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by
+				 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by, layer
 				 FROM memories WHERE key = ? AND scope = 'agent' AND project = ? AND agent_name = ? AND archived_at IS NULL
 				 ORDER BY version DESC`
 		args = []any{key, project, agentName}
 	case "project":
 		query = `SELECT id, key, value, tags, scope, project, agent_name, confidence, version,
-				 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by
+				 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by, layer
 				 FROM memories WHERE key = ? AND scope = 'project' AND project = ? AND archived_at IS NULL
 				 ORDER BY version DESC`
 		args = []any{key, project}
 	case "global":
 		query = `SELECT id, key, value, tags, scope, project, agent_name, confidence, version,
-				 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by
+				 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by, layer
 				 FROM memories WHERE key = ? AND scope = 'global' AND archived_at IS NULL
 				 ORDER BY version DESC`
 		args = []any{key}
@@ -197,7 +202,7 @@ func (d *DB) SearchMemory(project, agentName, query string, tags []string, scope
 	if query != "" {
 		sql = fmt.Sprintf(
 			`SELECT m.id, m.key, m.value, m.tags, m.scope, m.project, m.agent_name, m.confidence, m.version,
-			 m.supersedes, m.conflict_with, m.created_at, m.updated_at, m.archived_at, m.archived_by
+			 m.supersedes, m.conflict_with, m.created_at, m.updated_at, m.archived_at, m.archived_by, m.layer
 			 FROM memories m
 			 JOIN memories_fts f ON m.rowid = f.rowid
 			 WHERE %s AND memories_fts MATCH ?
@@ -208,7 +213,7 @@ func (d *DB) SearchMemory(project, agentName, query string, tags []string, scope
 	} else {
 		sql = fmt.Sprintf(
 			`SELECT m.id, m.key, m.value, m.tags, m.scope, m.project, m.agent_name, m.confidence, m.version,
-			 m.supersedes, m.conflict_with, m.created_at, m.updated_at, m.archived_at, m.archived_by
+			 m.supersedes, m.conflict_with, m.created_at, m.updated_at, m.archived_at, m.archived_by, m.layer
 			 FROM memories m
 			 WHERE %s
 			 ORDER BY m.updated_at DESC
@@ -255,7 +260,7 @@ func (d *DB) ListMemories(project, scope, agentName string, tags []string, limit
 
 	q := fmt.Sprintf(
 		`SELECT id, key, value, tags, scope, project, agent_name, confidence, version,
-		 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by
+		 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by, layer
 		 FROM memories WHERE %s ORDER BY updated_at DESC LIMIT ?`, where,
 	)
 
@@ -306,7 +311,7 @@ func (d *DB) ResolveConflict(project, agentName, key, chosenValue, scope string)
 	case "agent":
 		memories, err = d.queryMemories(
 			`SELECT id, key, value, tags, scope, project, agent_name, confidence, version,
-			 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by
+			 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by, layer
 			 FROM memories WHERE key = ? AND scope = 'agent' AND project = ? AND agent_name = ? AND archived_at IS NULL
 			 ORDER BY version DESC`,
 			key, project, agentName,
@@ -314,7 +319,7 @@ func (d *DB) ResolveConflict(project, agentName, key, chosenValue, scope string)
 	case "project":
 		memories, err = d.queryMemories(
 			`SELECT id, key, value, tags, scope, project, agent_name, confidence, version,
-			 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by
+			 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by, layer
 			 FROM memories WHERE key = ? AND scope = 'project' AND project = ? AND archived_at IS NULL
 			 ORDER BY version DESC`,
 			key, project,
@@ -322,7 +327,7 @@ func (d *DB) ResolveConflict(project, agentName, key, chosenValue, scope string)
 	case "global":
 		memories, err = d.queryMemories(
 			`SELECT id, key, value, tags, scope, project, agent_name, confidence, version,
-			 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by
+			 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by, layer
 			 FROM memories WHERE key = ? AND scope = 'global' AND archived_at IS NULL
 			 ORDER BY version DESC`,
 			key,
@@ -397,6 +402,10 @@ func (d *DB) ResolveConflict(project, agentName, key, chosenValue, scope string)
 		highestVersion := memories[0].Version
 
 		id := uuid.New().String()
+		highestLayer := memories[0].Layer
+		if highestLayer == "" {
+			highestLayer = "behavior"
+		}
 		winner = &models.Memory{
 			ID:         id,
 			Key:        key,
@@ -410,14 +419,15 @@ func (d *DB) ResolveConflict(project, agentName, key, chosenValue, scope string)
 			Supersedes: &memories[0].ID,
 			CreatedAt:  now,
 			UpdatedAt:  now,
+			Layer:      highestLayer,
 		}
 
 		_, err := tx.Exec(
-			`INSERT INTO memories (id, key, value, tags, scope, project, agent_name, confidence, version, supersedes, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO memories (id, key, value, tags, scope, project, agent_name, confidence, version, supersedes, created_at, updated_at, layer)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			winner.ID, winner.Key, winner.Value, winner.Tags, winner.Scope, winner.Project,
 			winner.AgentName, winner.Confidence, winner.Version, winner.Supersedes,
-			winner.CreatedAt, winner.UpdatedAt,
+			winner.CreatedAt, winner.UpdatedAt, winner.Layer,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("insert resolution: %w", err)
@@ -438,7 +448,7 @@ func (d *DB) ListAllMemories(limit int) ([]models.Memory, error) {
 	}
 	return d.queryMemories(
 		`SELECT id, key, value, tags, scope, project, agent_name, confidence, version,
-		 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by
+		 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by, layer
 		 FROM memories WHERE archived_at IS NULL ORDER BY updated_at DESC LIMIT ?`,
 		limit,
 	)
@@ -454,7 +464,7 @@ func (d *DB) SearchAllMemories(query string, limit int) ([]models.Memory, error)
 	}
 	return d.queryMemories(
 		`SELECT m.id, m.key, m.value, m.tags, m.scope, m.project, m.agent_name, m.confidence, m.version,
-		 m.supersedes, m.conflict_with, m.created_at, m.updated_at, m.archived_at, m.archived_by
+		 m.supersedes, m.conflict_with, m.created_at, m.updated_at, m.archived_at, m.archived_by, m.layer
 		 FROM memories m
 		 JOIN memories_fts f ON m.rowid = f.rowid
 		 WHERE m.archived_at IS NULL AND memories_fts MATCH ?
@@ -485,7 +495,7 @@ func (d *DB) DeleteMemoryByID(id, archivedBy string) error {
 func (d *DB) GetMemoryByID(id string) (*models.Memory, error) {
 	mems, err := d.queryMemories(
 		`SELECT id, key, value, tags, scope, project, agent_name, confidence, version,
-		 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by
+		 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by, layer
 		 FROM memories WHERE id = ?`, id,
 	)
 	if err != nil {
@@ -518,19 +528,19 @@ func (d *DB) findActiveMemory(project, scope, agentName, key string) (*models.Me
 	switch scope {
 	case "agent":
 		query = `SELECT id, key, value, tags, scope, project, agent_name, confidence, version,
-				 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by
+				 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by, layer
 				 FROM memories WHERE key = ? AND scope = 'agent' AND project = ? AND agent_name = ? AND archived_at IS NULL
 				 ORDER BY version DESC LIMIT 1`
 		args = []any{key, project, agentName}
 	case "project":
 		query = `SELECT id, key, value, tags, scope, project, agent_name, confidence, version,
-				 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by
+				 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by, layer
 				 FROM memories WHERE key = ? AND scope = 'project' AND project = ? AND archived_at IS NULL
 				 ORDER BY version DESC LIMIT 1`
 		args = []any{key, project}
 	case "global":
 		query = `SELECT id, key, value, tags, scope, project, agent_name, confidence, version,
-				 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by
+				 supersedes, conflict_with, created_at, updated_at, archived_at, archived_by, layer
 				 FROM memories WHERE key = ? AND scope = 'global' AND archived_at IS NULL
 				 ORDER BY version DESC LIMIT 1`
 		args = []any{key}
@@ -562,7 +572,7 @@ func (d *DB) queryMemories(query string, args ...any) ([]models.Memory, error) {
 			&m.ID, &m.Key, &m.Value, &m.Tags, &m.Scope, &m.Project,
 			&m.AgentName, &m.Confidence, &m.Version,
 			&m.Supersedes, &m.ConflictWith,
-			&m.CreatedAt, &m.UpdatedAt, &m.ArchivedAt, &m.ArchivedBy,
+			&m.CreatedAt, &m.UpdatedAt, &m.ArchivedAt, &m.ArchivedBy, &m.Layer,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan memory: %w", err)

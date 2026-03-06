@@ -9,14 +9,18 @@ import (
 	"github.com/google/uuid"
 )
 
-func (d *DB) RegisterAgent(project, name, role, description string, reportsTo, sessionID *string) (*models.Agent, error) {
+const agentColumns = "id, name, role, description, registered_at, last_seen, project, reports_to, profile_slug, status, deactivated_at, is_executive, session_id"
+
+func scanAgent(row interface{ Scan(...any) error }) (models.Agent, error) {
+	var a models.Agent
+	err := row.Scan(&a.ID, &a.Name, &a.Role, &a.Description, &a.RegisteredAt, &a.LastSeen, &a.Project, &a.ReportsTo, &a.ProfileSlug, &a.Status, &a.DeactivatedAt, &a.IsExecutive, &a.SessionID)
+	return a, err
+}
+
+func (d *DB) RegisterAgent(project, name, role, description string, reportsTo, profileSlug *string, isExecutive bool, sessionID *string) (*models.Agent, bool, error) {
 	now := time.Now().UTC().Format(time.RFC3339)
 
-	// Upsert: update if exists, insert if not
-	var existing models.Agent
-	err := d.conn.QueryRow("SELECT id, name, role, description, registered_at, last_seen, project, reports_to, session_id FROM agents WHERE name = ? AND project = ?", name, project).
-		Scan(&existing.ID, &existing.Name, &existing.Role, &existing.Description, &existing.RegisteredAt, &existing.LastSeen, &existing.Project, &existing.ReportsTo, &existing.SessionID)
-
+	a, err := scanAgent(d.conn.QueryRow("SELECT "+agentColumns+" FROM agents WHERE name = ? AND project = ?", name, project))
 	if err == sql.ErrNoRows {
 		agent := &models.Agent{
 			ID:           uuid.New().String(),
@@ -27,35 +31,43 @@ func (d *DB) RegisterAgent(project, name, role, description string, reportsTo, s
 			LastSeen:     now,
 			Project:      project,
 			ReportsTo:    reportsTo,
+			ProfileSlug:  profileSlug,
+			Status:       "active",
+			IsExecutive:  isExecutive,
 			SessionID:    sessionID,
 		}
 		_, err := d.conn.Exec(
-			"INSERT INTO agents (id, name, role, description, registered_at, last_seen, project, reports_to, session_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-			agent.ID, agent.Name, agent.Role, agent.Description, agent.RegisteredAt, agent.LastSeen, agent.Project, agent.ReportsTo, agent.SessionID,
+			"INSERT INTO agents ("+agentColumns+") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			agent.ID, agent.Name, agent.Role, agent.Description, agent.RegisteredAt, agent.LastSeen,
+			agent.Project, agent.ReportsTo, agent.ProfileSlug, agent.Status, agent.DeactivatedAt, agent.IsExecutive, agent.SessionID,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("insert agent: %w", err)
+			return nil, false, fmt.Errorf("insert agent: %w", err)
 		}
-		return agent, nil
+		return agent, false, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("query agent: %w", err)
+		return nil, false, fmt.Errorf("query agent: %w", err)
 	}
 
-	// Update existing
+	// Existing agent — this is a respawn
 	_, err = d.conn.Exec(
-		"UPDATE agents SET role = ?, description = ?, last_seen = ?, reports_to = ?, session_id = ? WHERE name = ? AND project = ?",
-		role, description, now, reportsTo, sessionID, name, project,
+		"UPDATE agents SET role = ?, description = ?, last_seen = ?, reports_to = ?, profile_slug = ?, is_executive = ?, session_id = ?, status = 'active', deactivated_at = NULL WHERE name = ? AND project = ?",
+		role, description, now, reportsTo, profileSlug, isExecutive, sessionID, name, project,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("update agent: %w", err)
+		return nil, false, fmt.Errorf("update agent: %w", err)
 	}
-	existing.Role = role
-	existing.Description = description
-	existing.LastSeen = now
-	existing.ReportsTo = reportsTo
-	existing.SessionID = sessionID
-	return &existing, nil
+	a.Role = role
+	a.Description = description
+	a.LastSeen = now
+	a.ReportsTo = reportsTo
+	a.ProfileSlug = profileSlug
+	a.IsExecutive = isExecutive
+	a.SessionID = sessionID
+	a.Status = "active"
+	a.DeactivatedAt = nil
+	return &a, true, nil
 }
 
 func (d *DB) TouchAgent(project, name string) error {
@@ -65,7 +77,7 @@ func (d *DB) TouchAgent(project, name string) error {
 }
 
 func (d *DB) ListAgents(project string) ([]models.Agent, error) {
-	rows, err := d.conn.Query("SELECT id, name, role, description, registered_at, last_seen, project, reports_to, session_id FROM agents WHERE project = ? ORDER BY name", project)
+	rows, err := d.conn.Query("SELECT "+agentColumns+" FROM agents WHERE project = ? AND status IN ('active', 'sleeping', 'inactive') ORDER BY name", project)
 	if err != nil {
 		return nil, fmt.Errorf("list agents: %w", err)
 	}
@@ -73,8 +85,8 @@ func (d *DB) ListAgents(project string) ([]models.Agent, error) {
 
 	var agents []models.Agent
 	for rows.Next() {
-		var a models.Agent
-		if err := rows.Scan(&a.ID, &a.Name, &a.Role, &a.Description, &a.RegisteredAt, &a.LastSeen, &a.Project, &a.ReportsTo, &a.SessionID); err != nil {
+		a, err := scanAgent(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan agent: %w", err)
 		}
 		agents = append(agents, a)
@@ -82,23 +94,52 @@ func (d *DB) ListAgents(project string) ([]models.Agent, error) {
 	return agents, rows.Err()
 }
 
-// PurgeStaleAgents removes agents whose last_seen is older than the given duration.
-// Returns the number of agents removed. Global across all projects.
-func (d *DB) PurgeStaleAgents(maxAge time.Duration) (int, error) {
+// MarkStaleAgentsInactive marks agents whose last_seen is older than the given duration as inactive.
+func (d *DB) MarkStaleAgentsInactive(maxAge time.Duration) (int, error) {
 	cutoff := time.Now().UTC().Add(-maxAge).Format(time.RFC3339)
-	result, err := d.conn.Exec("DELETE FROM agents WHERE last_seen < ?", cutoff)
+	now := time.Now().UTC().Format(time.RFC3339)
+	result, err := d.conn.Exec(
+		"UPDATE agents SET status = 'inactive', deactivated_at = ? WHERE last_seen < ? AND status = 'active'",
+		now, cutoff,
+	)
 	if err != nil {
-		return 0, fmt.Errorf("purge stale agents: %w", err)
+		return 0, fmt.Errorf("mark stale agents inactive: %w", err)
 	}
 	n, _ := result.RowsAffected()
 	return int(n), nil
 }
 
+// SleepAgent sets an agent to sleeping status (visible but not working).
+func (d *DB) SleepAgent(project, name string) error {
+	_, err := d.conn.Exec(
+		"UPDATE agents SET status = 'sleeping' WHERE name = ? AND project = ? AND status = 'active'",
+		name, project,
+	)
+	return err
+}
+
+// DeactivateAgent explicitly deactivates an agent.
+func (d *DB) DeactivateAgent(project, name string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := d.conn.Exec(
+		"UPDATE agents SET status = 'inactive', deactivated_at = ? WHERE name = ? AND project = ? AND status IN ('active', 'sleeping')",
+		now, name, project,
+	)
+	return err
+}
+
+// DeleteAgent soft-deletes an agent (disappears from UI, stays in DB).
+func (d *DB) DeleteAgent(project, name string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := d.conn.Exec(
+		"UPDATE agents SET status = 'deleted', deactivated_at = ? WHERE name = ? AND project = ?",
+		now, name, project,
+	)
+	return err
+}
+
 func (d *DB) GetAgent(project, name string) (*models.Agent, error) {
-	var a models.Agent
-	err := d.conn.QueryRow(
-		"SELECT id, name, role, description, registered_at, last_seen, project, reports_to, session_id FROM agents WHERE name = ? AND project = ?", name, project,
-	).Scan(&a.ID, &a.Name, &a.Role, &a.Description, &a.RegisteredAt, &a.LastSeen, &a.Project, &a.ReportsTo, &a.SessionID)
+	a, err := scanAgent(d.conn.QueryRow("SELECT "+agentColumns+" FROM agents WHERE name = ? AND project = ?", name, project))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -108,10 +149,10 @@ func (d *DB) GetAgent(project, name string) (*models.Agent, error) {
 	return &a, nil
 }
 
-// GetOrgTree returns all agents ordered for tree display (managers first).
+// GetOrgTree returns all active agents ordered for tree display (managers first).
 func (d *DB) GetOrgTree(project string) ([]models.Agent, error) {
 	rows, err := d.conn.Query(
-		"SELECT id, name, role, description, registered_at, last_seen, project, reports_to, session_id FROM agents WHERE project = ? ORDER BY reports_to IS NULL DESC, reports_to, name",
+		"SELECT "+agentColumns+" FROM agents WHERE project = ? AND status = 'active' ORDER BY reports_to IS NULL DESC, reports_to, name",
 		project,
 	)
 	if err != nil {
@@ -121,8 +162,8 @@ func (d *DB) GetOrgTree(project string) ([]models.Agent, error) {
 
 	var agents []models.Agent
 	for rows.Next() {
-		var a models.Agent
-		if err := rows.Scan(&a.ID, &a.Name, &a.Role, &a.Description, &a.RegisteredAt, &a.LastSeen, &a.Project, &a.ReportsTo, &a.SessionID); err != nil {
+		a, err := scanAgent(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan agent: %w", err)
 		}
 		agents = append(agents, a)

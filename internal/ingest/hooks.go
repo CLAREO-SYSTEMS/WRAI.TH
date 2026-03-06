@@ -110,14 +110,10 @@ func (h *hooksWatcher) processFile(path string) {
 		return
 	}
 
-	// Filter: only process events from registered agent sessions
-	if h.sessionProvider != nil {
-		known := h.sessionProvider()
-		if !known[he.SessionID] {
-			os.Remove(path)
-			return
-		}
-	}
+	// Note: we no longer filter by registered sessions here.
+	// All events are ingested; the UI/API can filter by known sessions if needed.
+	// This avoids the chicken-and-egg problem where agents need to register
+	// before their activity can be tracked.
 
 	// Parse timestamp
 	ts, err := time.Parse(time.RFC3339, he.Timestamp)
@@ -128,12 +124,14 @@ func (h *hooksWatcher) processFile(path string) {
 	evtType := EventType(he.Type)
 	activity := MapToolToActivity(he.Tool)
 
-	// For spawn/exit events, override activity
+	// Override activity for lifecycle events
 	switch evtType {
 	case EventAgentSpawn:
 		activity = ActivityReading
 	case EventAgentExit:
 		activity = ActivityIdle
+	case EventStop:
+		activity = ActivityWaiting
 	}
 
 	evt := AgentEvent{

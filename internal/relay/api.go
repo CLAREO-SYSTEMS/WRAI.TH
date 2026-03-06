@@ -56,6 +56,44 @@ func (r *Relay) ServeAPI(w http.ResponseWriter, req *http.Request) {
 		r.apiDeleteMemory(w, path)
 	case path == "/activity" && req.Method == http.MethodGet:
 		r.apiGetActivity(w)
+	case path == "/activity/stream" && req.Method == http.MethodGet:
+		r.apiStreamActivity(w, req)
+	// Task endpoints
+	case path == "/tasks/all" && req.Method == http.MethodGet:
+		r.apiGetAllTasks(w)
+	case path == "/tasks" && req.Method == http.MethodGet:
+		r.apiGetTasks(w, req)
+	case path == "/tasks/latest" && req.Method == http.MethodGet:
+		r.apiGetLatestTasks(w, req)
+	case path == "/tasks" && req.Method == http.MethodPost:
+		r.apiDispatchTask(w, req)
+	case strings.HasPrefix(path, "/tasks/") && strings.HasSuffix(path, "/transition") && req.Method == http.MethodPost:
+		r.apiTransitionTask(w, req, path)
+	case strings.HasPrefix(path, "/tasks/") && req.Method == http.MethodPut:
+		r.apiUpdateTask(w, req, path)
+	case strings.HasPrefix(path, "/tasks/") && req.Method == http.MethodDelete:
+		r.apiDeleteTask(w, req, path)
+	case strings.HasPrefix(path, "/tasks/") && req.Method == http.MethodGet:
+		r.apiGetTask(w, req, path)
+	// Profile endpoints
+	case path == "/profiles" && req.Method == http.MethodGet:
+		r.apiGetProfiles(w, req)
+	case strings.HasPrefix(path, "/profiles/") && req.Method == http.MethodGet:
+		r.apiGetProfile(w, req, path)
+	// Org + Team endpoints
+	case path == "/orgs" && req.Method == http.MethodGet:
+		r.apiGetOrgs(w)
+	case path == "/teams/all" && req.Method == http.MethodGet:
+		r.apiGetAllTeams(w)
+	case path == "/teams" && req.Method == http.MethodGet:
+		r.apiGetTeams(w, req)
+	case strings.HasPrefix(path, "/teams/") && strings.HasSuffix(path, "/members") && req.Method == http.MethodGet:
+		r.apiGetTeamMembers(w, req, path)
+	// Board endpoints
+	case path == "/boards" && req.Method == http.MethodGet:
+		r.apiGetBoards(w, req)
+	case path == "/boards/all" && req.Method == http.MethodGet:
+		r.apiGetAllBoards(w)
 	default:
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 	}
@@ -82,15 +120,29 @@ func (r *Relay) apiGetProjects(w http.ResponseWriter) {
 	writeJSON(w, projects)
 }
 
+type apiTeamRef struct {
+	Slug string `json:"slug"`
+	Name string `json:"name"`
+	Type string `json:"type"`
+	Role string `json:"role"`
+}
+
 type apiAgent struct {
-	Name         string  `json:"name"`
-	Role         string  `json:"role"`
-	Description  string  `json:"description"`
-	LastSeen     string  `json:"last_seen"`
-	RegisteredAt string  `json:"registered_at"`
-	Online       bool    `json:"online"`
-	ReportsTo    *string `json:"reports_to,omitempty"`
-	Project      string  `json:"project"`
+	Name         string       `json:"name"`
+	Role         string       `json:"role"`
+	Description  string       `json:"description"`
+	LastSeen     string       `json:"last_seen"`
+	RegisteredAt string       `json:"registered_at"`
+	Online       bool         `json:"online"`
+	ReportsTo    *string      `json:"reports_to,omitempty"`
+	Project      string       `json:"project"`
+	ProfileSlug  *string      `json:"profile_slug,omitempty"`
+	Status       string       `json:"status"`
+	IsExecutive  bool         `json:"is_executive"`
+	SessionID    *string      `json:"session_id,omitempty"`
+	Activity     string       `json:"activity,omitempty"`
+	ActivityTool string       `json:"activity_tool,omitempty"`
+	Teams        []apiTeamRef `json:"teams,omitempty"`
 }
 
 func (r *Relay) apiGetAgents(w http.ResponseWriter, req *http.Request) {
@@ -102,26 +154,63 @@ func (r *Relay) apiGetAgents(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Bulk-fetch team memberships
+	memberships, _ := r.DB.GetAllTeamMemberships()
+	teamsByAgent := make(map[string][]apiTeamRef)
+	for _, m := range memberships {
+		key := m.Project + ":" + m.AgentName
+		teamsByAgent[key] = append(teamsByAgent[key], apiTeamRef{
+			Slug: m.TeamSlug,
+			Name: m.TeamName,
+			Type: m.TeamType,
+			Role: m.Role,
+		})
+	}
+
+	actMap := r.activityBySessionID()
 	now := time.Now().UTC()
 	result := make([]apiAgent, 0, len(agents))
 	for _, a := range agents {
-		online := false
-		if t, err := time.Parse(time.RFC3339, a.LastSeen); err == nil {
-			online = now.Sub(t) < 5*time.Minute
-		}
-		result = append(result, apiAgent{
+		key := project + ":" + a.Name
+		aa := apiAgent{
 			Name:         a.Name,
 			Role:         a.Role,
 			Description:  a.Description,
 			LastSeen:     a.LastSeen,
 			RegisteredAt: a.RegisteredAt,
-			Online:       online,
 			ReportsTo:    a.ReportsTo,
 			Project:      project,
-		})
+			ProfileSlug:  a.ProfileSlug,
+			Status:       a.Status,
+			IsExecutive:  a.IsExecutive,
+			SessionID:    a.SessionID,
+			Teams:        teamsByAgent[key],
+		}
+		online := false
+		if t, err := time.Parse(time.RFC3339, a.LastSeen); err == nil {
+			online = now.Sub(t) < 5*time.Minute
+		}
+		aa.Online = online
+		if a.SessionID != nil {
+			if s, ok := actMap[*a.SessionID]; ok {
+				aa.Activity = string(s.Activity)
+				aa.ActivityTool = s.Tool
+			}
+		}
+		result = append(result, aa)
 	}
 
 	writeJSON(w, result)
+}
+
+func (r *Relay) activityBySessionID() map[string]ingest.SessionState {
+	m := make(map[string]ingest.SessionState)
+	if r.Ingester != nil {
+		for _, s := range r.Ingester.GetSessions() {
+			m[s.SessionID] = s
+		}
+	}
+	return m
 }
 
 func (r *Relay) apiGetAllAgents(w http.ResponseWriter) {
@@ -131,6 +220,20 @@ func (r *Relay) apiGetAllAgents(w http.ResponseWriter) {
 		return
 	}
 
+	// Bulk-fetch team memberships
+	memberships, _ := r.DB.GetAllTeamMemberships()
+	teamsByAgent := make(map[string][]apiTeamRef)
+	for _, m := range memberships {
+		key := m.Project + ":" + m.AgentName
+		teamsByAgent[key] = append(teamsByAgent[key], apiTeamRef{
+			Slug: m.TeamSlug,
+			Name: m.TeamName,
+			Type: m.TeamType,
+			Role: m.Role,
+		})
+	}
+
+	actMap := r.activityBySessionID()
 	now := time.Now().UTC()
 	result := make([]apiAgent, 0, len(agents))
 	for _, a := range agents {
@@ -138,7 +241,7 @@ func (r *Relay) apiGetAllAgents(w http.ResponseWriter) {
 		if t, err := time.Parse(time.RFC3339, a.LastSeen); err == nil {
 			online = now.Sub(t) < 5*time.Minute
 		}
-		result = append(result, apiAgent{
+		aa := apiAgent{
 			Name:         a.Name,
 			Role:         a.Role,
 			Description:  a.Description,
@@ -147,7 +250,19 @@ func (r *Relay) apiGetAllAgents(w http.ResponseWriter) {
 			Online:       online,
 			ReportsTo:    a.ReportsTo,
 			Project:      a.Project,
-		})
+			ProfileSlug:  a.ProfileSlug,
+			Status:       a.Status,
+			IsExecutive:  a.IsExecutive,
+			SessionID:    a.SessionID,
+			Teams:        teamsByAgent[a.Project+":"+a.Name],
+		}
+		if a.SessionID != nil {
+			if s, ok := actMap[*a.SessionID]; ok {
+				aa.Activity = string(s.Activity)
+				aa.ActivityTool = s.Tool
+			}
+		}
+		result = append(result, aa)
 	}
 
 	writeJSON(w, result)
@@ -423,6 +538,7 @@ func (r *Relay) apiPostMemory(w http.ResponseWriter, req *http.Request) {
 		Tags       []string `json:"tags"`
 		Scope      string   `json:"scope"`
 		Confidence string   `json:"confidence"`
+		Layer      string   `json:"layer"`
 	}
 	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
@@ -443,7 +559,7 @@ func (r *Relay) apiPostMemory(w http.ResponseWriter, req *http.Request) {
 	}
 
 	tagsJSON := db.TagsToJSON(body.Tags)
-	mem, err := r.DB.SetMemory(body.Project, body.AgentName, body.Key, body.Value, tagsJSON, body.Scope, body.Confidence)
+	mem, err := r.DB.SetMemory(body.Project, body.AgentName, body.Key, body.Value, tagsJSON, body.Scope, body.Confidence, body.Layer)
 	if err != nil {
 		http.Error(w, `{"error":"failed to set memory"}`, http.StatusInternalServerError)
 		return
@@ -515,8 +631,464 @@ func (r *Relay) apiGetActivity(w http.ResponseWriter) {
 	writeJSON(w, sessions)
 }
 
+type ssePayload struct {
+	Sessions []ingest.SessionState `json:"sessions"`
+	Agents   []sseAgent            `json:"agents"`
+}
+
+type sseAgent struct {
+	Name         string  `json:"name"`
+	Project      string  `json:"project"`
+	Role         string  `json:"role"`
+	Status       string  `json:"status"`       // busy, active, sleeping, inactive, deleted
+	Activity     string  `json:"activity"`      // typing, reading, terminal, browsing, thinking, waiting, idle
+	ActivityTool string  `json:"activity_tool"` // tool name when busy
+	SessionID    *string `json:"session_id,omitempty"`
+}
+
+func (r *Relay) buildSSEPayload(sessions []ingest.SessionState) ssePayload {
+	// Build session lookup
+	sessMap := make(map[string]ingest.SessionState)
+	for _, s := range sessions {
+		sessMap[s.SessionID] = s
+	}
+
+	agents, _ := r.DB.ListAllAgents()
+	now := time.Now().UTC()
+	sseAgents := make([]sseAgent, 0, len(agents))
+
+	for _, a := range agents {
+		sa := sseAgent{
+			Name:      a.Name,
+			Project:   a.Project,
+			Role:      a.Role,
+			Status:    a.Status, // DB status: active, sleeping, inactive, deleted
+			SessionID: a.SessionID,
+		}
+
+		// Enrich with SSE activity if session linked
+		if a.SessionID != nil {
+			if s, ok := sessMap[*a.SessionID]; ok {
+				sa.Activity = string(s.Activity)
+				if s.Activity != ingest.ActivityIdle && s.Activity != ingest.ActivityWaiting && s.Activity != ingest.ActivityThinking {
+					sa.ActivityTool = s.Tool
+				}
+
+				// Derive status from activity
+				switch {
+				case a.Status == "sleeping":
+					// sleeping stays sleeping
+				case a.Status == "deleted":
+					// deleted stays deleted
+				case s.Activity != ingest.ActivityIdle && s.State != "idle" && s.State != "exited":
+					sa.Status = "busy"
+				case now.Sub(s.LastEvent) < 5*time.Minute:
+					sa.Status = "active"
+				default:
+					sa.Status = "inactive"
+				}
+			}
+		}
+
+		sseAgents = append(sseAgents, sa)
+	}
+
+	return ssePayload{Sessions: sessions, Agents: sseAgents}
+}
+
+func (r *Relay) apiStreamActivity(w http.ResponseWriter, req *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	if r.Ingester == nil {
+		return
+	}
+
+	ch := r.Ingester.SubscribeActivity()
+	defer r.Ingester.UnsubscribeActivity(ch)
+
+	// Send initial state
+	sessions := r.Ingester.GetSessions()
+	if sessions == nil {
+		sessions = make([]ingest.SessionState, 0)
+	}
+	payload := r.buildSSEPayload(sessions)
+	data, _ := json.Marshal(payload)
+	fmt.Fprintf(w, "data: %s\n\n", data)
+	flusher.Flush()
+
+	for {
+		select {
+		case <-req.Context().Done():
+			return
+		case snap, ok := <-ch:
+			if !ok {
+				return
+			}
+			payload := r.buildSSEPayload(snap)
+			data, _ := json.Marshal(payload)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		}
+	}
+}
+
 func writeJSON(w http.ResponseWriter, v any) {
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		http.Error(w, `{"error":"encode failed"}`, http.StatusInternalServerError)
 	}
+}
+
+// --- Task API endpoints ---
+
+func (r *Relay) apiGetTasks(w http.ResponseWriter, req *http.Request) {
+	project := projectFromRequest(req)
+	status := req.URL.Query().Get("status")
+	profile := req.URL.Query().Get("profile")
+	priority := req.URL.Query().Get("priority")
+
+	boardID := req.URL.Query().Get("board_id")
+	tasks, err := r.DB.ListTasks(project, status, profile, priority, "", boardID, 100)
+	if err != nil {
+		http.Error(w, `{"error":"failed to list tasks"}`, http.StatusInternalServerError)
+		return
+	}
+	if tasks == nil {
+		tasks = []models.Task{}
+	}
+	writeJSON(w, tasks)
+}
+
+func (r *Relay) apiGetAllTasks(w http.ResponseWriter) {
+	tasks, err := r.DB.ListAllTasks(200)
+	if err != nil {
+		http.Error(w, `{"error":"failed to list tasks"}`, http.StatusInternalServerError)
+		return
+	}
+	if tasks == nil {
+		tasks = []models.Task{}
+	}
+	writeJSON(w, tasks)
+}
+
+func (r *Relay) apiGetLatestTasks(w http.ResponseWriter, req *http.Request) {
+	project := req.URL.Query().Get("project")
+	since := req.URL.Query().Get("since")
+	if since == "" {
+		since = time.Now().UTC().Add(-30 * time.Second).Format("2006-01-02T15:04:05.000000Z")
+	}
+
+	tasks, err := r.DB.GetTasksSince(project, since, 100)
+	if err != nil {
+		http.Error(w, `{"error":"failed to get tasks"}`, http.StatusInternalServerError)
+		return
+	}
+	if tasks == nil {
+		tasks = []models.Task{}
+	}
+	writeJSON(w, tasks)
+}
+
+func (r *Relay) apiGetTask(w http.ResponseWriter, req *http.Request, path string) {
+	project := projectFromRequest(req)
+	taskID := strings.TrimPrefix(path, "/tasks/")
+	if taskID == "" {
+		http.Error(w, `{"error":"missing task id"}`, http.StatusBadRequest)
+		return
+	}
+
+	task, err := r.DB.GetTask(taskID, project)
+	if err != nil {
+		http.Error(w, `{"error":"failed to get task"}`, http.StatusInternalServerError)
+		return
+	}
+	if task == nil {
+		http.Error(w, `{"error":"task not found"}`, http.StatusNotFound)
+		return
+	}
+	writeJSON(w, task)
+}
+
+func (r *Relay) apiDispatchTask(w http.ResponseWriter, req *http.Request) {
+	var body struct {
+		Project      string  `json:"project"`
+		Profile      string  `json:"profile"`
+		Title        string  `json:"title"`
+		Description  string  `json:"description"`
+		Priority     string  `json:"priority"`
+		ParentTaskID *string `json:"parent_task_id,omitempty"`
+		BoardID      *string `json:"board_id,omitempty"`
+	}
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if body.Profile == "" || body.Title == "" {
+		http.Error(w, `{"error":"profile and title are required"}`, http.StatusBadRequest)
+		return
+	}
+	if body.Project == "" {
+		body.Project = "default"
+	}
+
+	task, err := r.DB.DispatchTask(body.Project, body.Profile, "user", body.Title, body.Description, body.Priority, body.ParentTaskID, body.BoardID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, task)
+}
+
+func (r *Relay) apiTransitionTask(w http.ResponseWriter, req *http.Request, path string) {
+	// path: /tasks/{id}/transition
+	trimmed := strings.TrimPrefix(path, "/tasks/")
+	taskID, _, _ := strings.Cut(trimmed, "/")
+	if taskID == "" {
+		http.Error(w, `{"error":"missing task id"}`, http.StatusBadRequest)
+		return
+	}
+
+	var body struct {
+		Project string  `json:"project"`
+		Status  string  `json:"status"`
+		Agent   string  `json:"agent"`
+		Result  *string `json:"result,omitempty"`
+		Reason  *string `json:"reason,omitempty"`
+	}
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if body.Status == "" {
+		http.Error(w, `{"error":"status is required"}`, http.StatusBadRequest)
+		return
+	}
+	if body.Project == "" {
+		body.Project = "default"
+	}
+	if body.Agent == "" {
+		body.Agent = "user"
+	}
+
+	var task *models.Task
+	var err error
+	switch body.Status {
+	case "pending":
+		task, err = r.DB.ResetTask(taskID, body.Agent, body.Project)
+	case "accepted":
+		task, err = r.DB.ClaimTask(taskID, body.Agent, body.Project)
+	case "in-progress":
+		task, err = r.DB.StartTask(taskID, body.Agent, body.Project)
+	case "done":
+		task, err = r.DB.CompleteTask(taskID, body.Agent, body.Project, body.Result)
+	case "blocked":
+		task, err = r.DB.BlockTask(taskID, body.Agent, body.Project, body.Reason)
+	default:
+		http.Error(w, `{"error":"invalid status"}`, http.StatusBadRequest)
+		return
+	}
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, task)
+}
+
+func (r *Relay) apiUpdateTask(w http.ResponseWriter, req *http.Request, path string) {
+	trimmed := strings.TrimPrefix(path, "/tasks/")
+	taskID := trimmed
+	if taskID == "" {
+		http.Error(w, `{"error":"missing task id"}`, http.StatusBadRequest)
+		return
+	}
+
+	var body struct {
+		Project     string  `json:"project"`
+		Title       *string `json:"title,omitempty"`
+		Description *string `json:"description,omitempty"`
+		Priority    *string `json:"priority,omitempty"`
+	}
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if body.Project == "" {
+		body.Project = "default"
+	}
+
+	task, err := r.DB.UpdateTaskFields(taskID, body.Project, body.Title, body.Description, body.Priority)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, task)
+}
+
+func (r *Relay) apiDeleteTask(w http.ResponseWriter, req *http.Request, path string) {
+	trimmed := strings.TrimPrefix(path, "/tasks/")
+	taskID := trimmed
+	if taskID == "" {
+		http.Error(w, `{"error":"missing task id"}`, http.StatusBadRequest)
+		return
+	}
+	project := req.URL.Query().Get("project")
+	if project == "" {
+		project = "default"
+	}
+
+	if err := r.DB.DeleteTask(taskID, project); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"deleted": true, "id": taskID})
+}
+
+// --- Profile API endpoints ---
+
+func (r *Relay) apiGetProfiles(w http.ResponseWriter, req *http.Request) {
+	project := projectFromRequest(req)
+
+	profiles, err := r.DB.ListProfiles(project)
+	if err != nil {
+		http.Error(w, `{"error":"failed to list profiles"}`, http.StatusInternalServerError)
+		return
+	}
+	if profiles == nil {
+		profiles = []models.Profile{}
+	}
+	writeJSON(w, profiles)
+}
+
+func (r *Relay) apiGetOrgs(w http.ResponseWriter) {
+	orgs, err := r.DB.ListOrgs()
+	if err != nil {
+		http.Error(w, `{"error":"failed to list orgs"}`, http.StatusInternalServerError)
+		return
+	}
+	if orgs == nil {
+		orgs = []models.Org{}
+	}
+	writeJSON(w, orgs)
+}
+
+func (r *Relay) apiGetAllTeams(w http.ResponseWriter) {
+	teams, err := r.DB.ListAllTeams()
+	if err != nil {
+		http.Error(w, `{"error":"failed to list teams"}`, http.StatusInternalServerError)
+		return
+	}
+	if teams == nil {
+		teams = []models.Team{}
+	}
+
+	// Enrich with member counts
+	type teamWithMembers struct {
+		models.Team
+		MemberCount int      `json:"member_count"`
+		Members     []string `json:"members"`
+	}
+	result := make([]teamWithMembers, 0, len(teams))
+	for _, t := range teams {
+		members, _ := r.DB.GetTeamMemberNames(t.ID)
+		if members == nil {
+			members = []string{}
+		}
+		result = append(result, teamWithMembers{
+			Team:        t,
+			MemberCount: len(members),
+			Members:     members,
+		})
+	}
+	writeJSON(w, result)
+}
+
+func (r *Relay) apiGetTeams(w http.ResponseWriter, req *http.Request) {
+	project := projectFromRequest(req)
+	teams, err := r.DB.ListTeams(project)
+	if err != nil {
+		http.Error(w, `{"error":"failed to list teams"}`, http.StatusInternalServerError)
+		return
+	}
+	if teams == nil {
+		teams = []models.Team{}
+	}
+	writeJSON(w, teams)
+}
+
+func (r *Relay) apiGetTeamMembers(w http.ResponseWriter, req *http.Request, path string) {
+	project := projectFromRequest(req)
+	trimmed := strings.TrimPrefix(path, "/teams/")
+	slug, _, _ := strings.Cut(trimmed, "/")
+	if slug == "" {
+		http.Error(w, `{"error":"missing team slug"}`, http.StatusBadRequest)
+		return
+	}
+
+	team, err := r.DB.GetTeam(project, slug)
+	if err != nil || team == nil {
+		http.Error(w, `{"error":"team not found"}`, http.StatusNotFound)
+		return
+	}
+
+	members, err := r.DB.GetTeamMembers(team.ID)
+	if err != nil {
+		http.Error(w, `{"error":"failed to get members"}`, http.StatusInternalServerError)
+		return
+	}
+	if members == nil {
+		members = []models.TeamMember{}
+	}
+	writeJSON(w, map[string]any{"team": team, "members": members})
+}
+
+func (r *Relay) apiGetProfile(w http.ResponseWriter, req *http.Request, path string) {
+	project := projectFromRequest(req)
+	slug := strings.TrimPrefix(path, "/profiles/")
+	if slug == "" {
+		http.Error(w, `{"error":"missing profile slug"}`, http.StatusBadRequest)
+		return
+	}
+
+	profile, err := r.DB.GetProfile(project, slug)
+	if err != nil {
+		http.Error(w, `{"error":"failed to get profile"}`, http.StatusInternalServerError)
+		return
+	}
+	if profile == nil {
+		http.Error(w, `{"error":"profile not found"}`, http.StatusNotFound)
+		return
+	}
+	writeJSON(w, profile)
+}
+
+func (r *Relay) apiGetBoards(w http.ResponseWriter, req *http.Request) {
+	project := projectFromRequest(req)
+	boards, err := r.DB.ListBoards(project)
+	if err != nil {
+		http.Error(w, `{"error":"failed to list boards"}`, http.StatusInternalServerError)
+		return
+	}
+	if boards == nil {
+		boards = []models.Board{}
+	}
+	writeJSON(w, boards)
+}
+
+func (r *Relay) apiGetAllBoards(w http.ResponseWriter) {
+	boards, err := r.DB.ListAllBoards()
+	if err != nil {
+		http.Error(w, `{"error":"failed to list boards"}`, http.StatusInternalServerError)
+		return
+	}
+	if boards == nil {
+		boards = []models.Board{}
+	}
+	writeJSON(w, boards)
 }

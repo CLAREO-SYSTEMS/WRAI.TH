@@ -104,3 +104,10 @@ func (r *SessionRegistry) NotifyBroadcast(project, senderName, subject, messageI
 		}
 	}
 }
+
+// NotifyProfile sends a notification to all connected agents running a specific profile in a project.
+func (r *SessionRegistry) NotifyProfile(project, profileSlug, senderName, subject, taskID string) {
+	// For now, we broadcast to all agents in the project since we don't track profile→session mapping.
+	// This is acceptable because agents filter by their own profile when picking up tasks.
+	r.NotifyBroadcast(project, senderName, subject, taskID)
+}

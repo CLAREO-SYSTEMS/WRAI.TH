@@ -14,20 +14,45 @@
       <span class="logo">AGENT RELAY</span>
       <span id="status-dot" class="status-dot"></span>
       <span id="agent-count" class="agent-count">0 agents</span>
+      <div class="mode-toggle">
+        <button class="mode-btn active" data-mode="canvas" title="Canvas mode [1]">
+          <span class="mode-icon">&#9678;</span>
+        </button>
+        <button class="mode-btn" data-mode="kanban" title="Kanban board [3]">
+          <span class="mode-icon">&#9638;</span>
+        </button>
+      </div>
+      <div class="font-scale-toggle">
+        <button class="scale-btn" data-scale="1">S</button>
+        <button class="scale-btn active" data-scale="1.2">M</button>
+        <button class="scale-btn" data-scale="1.5">L</button>
+      </div>
+      <button id="help-btn" class="help-btn" title="Help [?]">?</button>
     </div>
     <div class="header-tabs">
       <button id="tab-messages" class="header-tab active">Messages</button>
       <button id="tab-memories" class="header-tab">Memories <span id="memory-count" class="memory-badge">0</span></button>
+      <button id="tab-tasks" class="header-tab">Tasks <span id="task-count" class="memory-badge">0</span></button>
     </div>
   </header>
 
-  <main id="main">
+  <main id="main" class="mode-canvas">
     <div id="canvas-container">
       <canvas id="relay-canvas"></canvas>
     </div>
+
+    <!-- Kanban panel (hidden by default, shown in kanban mode) -->
+    <div id="kanban-panel" class="hidden"></div>
+
     <div id="messages-panel">
       <div id="messages-header">
         <span id="messages-title">Messages</span>
+        <div class="msg-filters">
+          <input id="msg-search" type="text" placeholder="Search... [/]" />
+          <select id="msg-conv-filter">
+            <option value="">All conversations</option>
+          </select>
+        </div>
       </div>
       <div id="messages-list"></div>
     </div>
@@ -49,6 +74,29 @@
         </div>
       </div>
       <div id="memories-list"></div>
+    </div>
+    <div id="tasks-panel" class="hidden">
+      <div id="tasks-header">
+        <div class="tasks-filters">
+          <button id="tasks-mine-filter" class="tasks-mine-btn" title="Show only my tasks">MY TASKS</button>
+          <select id="tasks-status-filter">
+            <option value="">All statuses</option>
+            <option value="pending">Pending</option>
+            <option value="accepted">Accepted</option>
+            <option value="in-progress">In Progress</option>
+            <option value="done">Done</option>
+            <option value="blocked">Blocked</option>
+          </select>
+          <select id="tasks-priority-filter">
+            <option value="">All priorities</option>
+            <option value="P0">P0</option>
+            <option value="P1">P1</option>
+            <option value="P2">P2</option>
+            <option value="P3">P3</option>
+          </select>
+        </div>
+      </div>
+      <div id="tasks-list"></div>
     </div>
   </main>
 
@@ -78,9 +126,115 @@
       <div class="detail-label">Direct Reports</div>
       <div id="detail-direct-reports" class="detail-value"></div>
     </div>
+    <div class="detail-section">
+      <div class="detail-label">Teams</div>
+      <div id="detail-teams" class="detail-value"></div>
+    </div>
+    <div id="detail-tasks-section" class="detail-section">
+      <div class="detail-label">Tasks</div>
+      <div id="detail-tasks" class="detail-value"></div>
+    </div>
   </div>
 
   <div id="user-questions" class="user-questions-panel"></div>
+
+  <!-- Help Modal -->
+  <div id="help-modal" class="help-modal hidden">
+    <div class="help-overlay"></div>
+    <div class="help-content">
+      <button id="help-close" class="help-close">&times;</button>
+      <h2>Agent Relay</h2>
+      <p class="help-subtitle">Multi-agent communication & orchestration platform</p>
+
+      <div class="help-section">
+        <h3>Canvas</h3>
+        <ul>
+          <li>Each <b>sprite</b> is an agent — 6 archetypes assigned by name hash</li>
+          <li><span class="help-tag gold">Golden aura</span> executive agents / rare 0.1% golden variant</li>
+          <li><span class="help-tag green">Green glow</span> agent is working on a task</li>
+          <li><span class="help-tag red">Red shake</span> agent is blocked</li>
+          <li>Click an agent to see details, teams, tasks</li>
+        </ul>
+      </div>
+
+      <div class="help-section">
+        <h3>Messages</h3>
+        <ul>
+          <li><b>Direct</b> — agent to agent</li>
+          <li><b>Broadcast</b> — <code>to: "*"</code> sends to all agents</li>
+          <li><b>Team</b> — <code>to: "team:slug"</code> fans out to team members</li>
+          <li><b>Conversation</b> — <code>to: "conversation:id"</code> multi-party thread</li>
+        </ul>
+        <p>Message types with distinct orb animations:</p>
+        <ul>
+          <li><span class="help-tag yellow">question</span> pulsating yellow, zigzag trail</li>
+          <li><span class="help-tag green">response</span> smooth green, flowing trail</li>
+          <li><span class="help-tag purple">notification</span> purple flash burst, ring trail</li>
+          <li><span class="help-tag pink">task</span> red diamond, sharp fast trail</li>
+        </ul>
+      </div>
+
+      <div class="help-section">
+        <h3>Tasks</h3>
+        <ul>
+          <li><b>dispatch_task</b> — create task for a profile (pending)</li>
+          <li><b>claim_task</b> — agent takes ownership (accepted)</li>
+          <li><b>start_task</b> — begin work (in-progress)</li>
+          <li><b>complete_task</b> — done with result</li>
+          <li><b>block_task</b> — blocked with reason</li>
+          <li>Priority: <code>P0</code> (critical) to <code>P3</code> (low)</li>
+        </ul>
+      </div>
+
+      <div class="help-section">
+        <h3>Memories</h3>
+        <ul>
+          <li><b>set_memory</b> — store key/value knowledge</li>
+          <li><b>get_memory</b> / <b>list_memories</b> — retrieve</li>
+          <li><b>search_memory</b> — full-text search (FTS5)</li>
+          <li><b>delete_memory</b> — remove a memory</li>
+          <li>Scopes: <code>global</code>, <code>project</code>, <code>agent</code></li>
+        </ul>
+      </div>
+
+      <div class="help-section">
+        <h3>Teams & Orgs</h3>
+        <ul>
+          <li><b>create_team</b> — types: <code>admin</code>, <code>regular</code>, <code>bot</code></li>
+          <li><b>add_team_member</b> / <b>remove_team_member</b></li>
+          <li>Team badges shown on agent sprites</li>
+          <li><span class="help-tag gold">COMEX/admin</span> teams have gold badges</li>
+          <li>Permission model: agents can only message same-team or reports_to chain</li>
+        </ul>
+      </div>
+
+      <div class="help-section">
+        <h3>Conversations</h3>
+        <ul>
+          <li><b>create_conversation</b> — start a multi-party thread</li>
+          <li><b>invite_to_conversation</b> — add members</li>
+          <li>Filter dropdown dims non-member agents on canvas</li>
+          <li><b>get_conversation_messages</b> — read thread history</li>
+        </ul>
+      </div>
+
+      <div class="help-section">
+        <h3>Keyboard Shortcuts</h3>
+        <table class="help-shortcuts">
+          <tr><td><kbd>1</kbd></td><td>Canvas mode</td></tr>
+          <tr><td><kbd>3</kbd></td><td>Kanban mode</td></tr>
+          <tr><td><kbd>/</kbd></td><td>Focus search</td></tr>
+          <tr><td><kbd>Esc</kbd></td><td>Close panel / clear filter</td></tr>
+          <tr><td><kbd>?</kbd></td><td>Toggle this help</td></tr>
+        </table>
+      </div>
+
+      <div class="help-section">
+        <h3>MCP Protocol</h3>
+        <p>All tools are accessible via JSON-RPC at <code>POST /mcp</code>. Connect any Claude Code instance as an MCP client.</p>
+      </div>
+    </div>
+  </div>
 
   <script type="module" src="/js/main.js"></script>
 </body>

@@ -7,6 +7,7 @@ type EventType string
 const (
 	EventToolStart    EventType = "tool_start"
 	EventToolEnd      EventType = "tool_end"
+	EventStop         EventType = "stop"
 	EventAgentSpawn   EventType = "agent_spawn"
 	EventAgentExit    EventType = "agent_exit"
 	EventIdle         EventType = "idle"
@@ -20,6 +21,7 @@ const (
 	ActivityReading  Activity = "reading"
 	ActivityTerminal Activity = "terminal"
 	ActivityBrowsing Activity = "browsing"
+	ActivityThinking Activity = "thinking"
 	ActivityIdle     Activity = "idle"
 	ActivityWaiting  Activity = "waiting"
 )

@@ -1,15 +1,17 @@
 export class APIClient {
-  constructor(onAgents, onConversations, onNewMessages, onActivity) {
+  constructor(onAgents, onConversations, onNewMessages, onNewTasks, onActivity) {
     this.onAgents = onAgents;
     this.onConversations = onConversations;
     this.onNewMessages = onNewMessages;
+    this.onNewTasks = onNewTasks;
     this.onActivity = onActivity;
 
     this._lastMessageTime = null;
+    this._lastTaskTime = null;
     this._agentTimer = null;
     this._msgTimer = null;
     this._convTimer = null;
-    this._activityTimer = null;
+    this._taskTimer = null;
     this._running = false;
   }
 
@@ -19,8 +21,11 @@ export class APIClient {
     // Initial fetch (cross-project)
     this.fetchAllAgents();
     this.fetchAllConversations();
+    this.fetchAllTasks().then(tasks => {
+      if (this.onNewTasks && tasks.length > 0) this.onNewTasks(tasks);
+    });
 
-    // Poll agents every 5s
+    // Poll agents every 5s (structural changes only, SSE handles status)
     this._agentTimer = setInterval(() => this.fetchAllAgents(), 5000);
 
     // Poll conversations every 10s
@@ -29,9 +34,41 @@ export class APIClient {
     // Poll new messages every 2s
     this._msgTimer = setInterval(() => this.fetchLatestMessagesAllProjects(), 2000);
 
-    // Poll activity every 2s
-    this.fetchActivity();
-    this._activityTimer = setInterval(() => this.fetchActivity(), 2000);
+    // Poll tasks every 3s
+    this._taskTimer = setInterval(() => this.fetchLatestTasks(), 3000);
+
+    // SSE for real-time activity + agent status (<100ms)
+    this._sseConnected = false;
+    this._activitySource = new EventSource("/api/activity/stream");
+    this._activitySource.onopen = () => {
+      console.log("[relay] SSE connected");
+      this._sseConnected = true;
+      // Kill fallback polling if SSE reconnects
+      if (this._activityTimer) {
+        clearInterval(this._activityTimer);
+        this._activityTimer = null;
+      }
+    };
+    this._activitySource.onmessage = (e) => {
+      try {
+        const payload = JSON.parse(e.data);
+        if (payload.sessions && payload.agents) {
+          if (this.onActivity) this.onActivity(payload.sessions, payload.agents);
+        } else {
+          if (this.onActivity) this.onActivity(payload, null);
+        }
+      } catch (err) {
+        console.error("[relay] SSE parse error:", err);
+      }
+    };
+    this._activitySource.onerror = (e) => {
+      console.warn("[relay] SSE error, state:", this._activitySource.readyState);
+      // Only fallback if SSE is fully closed (readyState === 2)
+      if (this._activitySource.readyState === 2 && !this._activityTimer) {
+        console.log("[relay] SSE closed, falling back to polling");
+        this._activityTimer = setInterval(() => this.fetchActivity(), 1000);
+      }
+    };
   }
 
   stop() {
@@ -39,6 +76,8 @@ export class APIClient {
     clearInterval(this._agentTimer);
     clearInterval(this._msgTimer);
     clearInterval(this._convTimer);
+    clearInterval(this._taskTimer);
+    if (this._activitySource) this._activitySource.close();
     clearInterval(this._activityTimer);
   }
 
@@ -181,6 +220,134 @@ export class APIClient {
         body: JSON.stringify({ chosen_value: chosenValue, project, scope }),
       });
       return res.ok ? await res.json() : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // --- Task API ---
+
+  async fetchAllTasks() {
+    try {
+      const res = await fetch("/api/tasks/all");
+      if (!res.ok) return [];
+      return await res.json();
+    } catch {
+      return [];
+    }
+  }
+
+  async fetchTasks(params = {}) {
+    try {
+      const qs = new URLSearchParams();
+      if (params.project) qs.set("project", params.project);
+      if (params.status) qs.set("status", params.status);
+      if (params.profile) qs.set("profile", params.profile);
+      if (params.priority) qs.set("priority", params.priority);
+      const res = await fetch(`/api/tasks?${qs}`);
+      if (!res.ok) return [];
+      return await res.json();
+    } catch {
+      return [];
+    }
+  }
+
+  async fetchLatestTasks() {
+    try {
+      const since = this._lastTaskTime || new Date(Date.now() - 30000).toISOString();
+      const res = await fetch(`/api/tasks/latest?since=${encodeURIComponent(since)}`);
+      if (!res.ok) return;
+      const tasks = await res.json();
+      if (tasks.length > 0) {
+        this._lastTaskTime = tasks[tasks.length - 1].dispatched_at;
+        if (this.onNewTasks) this.onNewTasks(tasks);
+      }
+    } catch {
+      // Silently ignore
+    }
+  }
+
+  async dispatchTask(data) {
+    try {
+      const res = await fetch("/api/tasks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch {
+      return null;
+    }
+  }
+
+  async transitionTask(taskId, status, project, agent, result, reason) {
+    try {
+      const body = { status, project: project || "default", agent: agent || "user" };
+      if (result) body.result = result;
+      if (reason) body.reason = reason;
+      const res = await fetch(`/api/tasks/${taskId}/transition`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch {
+      return null;
+    }
+  }
+
+  async fetchAllTeams() {
+    try {
+      const res = await fetch("/api/teams/all");
+      if (!res.ok) return [];
+      return await res.json();
+    } catch {
+      return [];
+    }
+  }
+
+  async fetchAllBoards() {
+    try {
+      const res = await fetch("/api/boards/all");
+      if (!res.ok) return [];
+      return await res.json();
+    } catch {
+      return [];
+    }
+  }
+
+  async updateTask(taskId, data) {
+    try {
+      const res = await fetch(`/api/tasks/${taskId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch {
+      return null;
+    }
+  }
+
+  async deleteTask(taskId, project) {
+    try {
+      const qs = project ? `?project=${encodeURIComponent(project)}` : "";
+      const res = await fetch(`/api/tasks/${taskId}${qs}`, { method: "DELETE" });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  async fetchTask(taskId, project) {
+    try {
+      const qs = project ? `?project=${encodeURIComponent(project)}` : "";
+      const res = await fetch(`/api/tasks/${taskId}${qs}`);
+      if (!res.ok) return null;
+      return await res.json();
     } catch {
       return null;
     }

@@ -1,19 +1,18 @@
 <div align="center">
 
-# Claude Agentic Relay
+# Agent Relay
 
-**Inter-agent communication & shared memory for Claude Code. One binary, zero config.**
+**Inter-agent communication, shared memory, task management & real-time visualization for Claude Code. One binary, zero config.**
 
 [![Go](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat-square&logo=go&logoColor=white)](https://go.dev)
 [![MCP](https://img.shields.io/badge/MCP-Streamable_HTTP-8A2BE2?style=flat-square)](https://modelcontextprotocol.io)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 [![Binary](https://img.shields.io/badge/Binary-~8MB-green?style=flat-square)]()
-[![Tokens](https://img.shields.io/badge/Token_savings-60--90%25-orange?style=flat-square)]()
 
-Running Claude Code on `backend` **and** `frontend` at the same time?<br>
+Running multiple Claude Code instances at the same time?<br>
 Right now they're blind to each other — and `/clear` kills everything they learned. **This fixes both.**
 
-[Install](#install) · [Web UI](#web-ui) · [Memory](#shared-memory) · [Hierarchy](#agent-hierarchy) · [User Questions](#user-questions) · [MCP Tools](#mcp-tools) · [How It Works](#how-it-works)
+[Install](#install) · [Web UI](#web-ui) · [Memory](#shared-memory) · [Tasks](#tasks--kanban) · [Teams](#teams--orgs) · [Activity Tracking](#activity-tracking) · [MCP Tools](#mcp-tools) · [How It Works](#how-it-works)
 
 </div>
 
@@ -21,31 +20,111 @@ Right now they're blind to each other — and `/clear` kills everything they lea
 
 ## Why
 
-Two problems kill multi-agent productivity:
+Three problems kill multi-agent productivity:
 
-1. **No communication.** Claude Code runs on your API, another instance on your frontend, maybe one on infra. They each make decisions the others should know about — API contracts change, types get renamed, endpoints move. Without the relay, **you** are the message bus.
+1. **No communication.** Agents run in isolation. They make decisions the others should know about — API contracts change, types get renamed, endpoints move. Without the relay, **you** are the message bus.
 
-2. **No memory.** When your backend agent discovers "the auth middleware expects JWT RS256 in the Authorization header," that knowledge evaporates on `/clear`. Next session, every agent rediscovers it from scratch. Context loss is the #1 pain point in AI agent development.
+2. **No memory.** When your backend agent discovers "the auth middleware expects JWT RS256," that knowledge evaporates on `/clear`. Next session, every agent rediscovers it from scratch.
 
-The relay solves both: **real-time messaging** so agents talk directly, and **persistent shared memory** so knowledge survives across sessions.
+3. **No coordination.** No task dispatch, no kanban, no team structure. You manually assign work and track progress across terminals.
+
+The relay solves all three: **real-time messaging**, **persistent shared memory**, and **task management with kanban** — all visible in a live web UI.
 
 ## Web UI
 
 The relay serves a real-time visualization at `http://localhost:8090/` — embedded in the binary, zero setup.
 
-<!-- Screenshots and demo video coming soon -->
-
 **Features:**
-- Pixel-art agent sprites arranged in a circle, animated message orbs
-- Org hierarchy lines (dashed) between agents and their managers
-- Click any agent to see details, reports-to, and direct reports
-- Project selector + conversation filter
-- User question cards — agents ask you questions, you answer from the browser
-- **Memory panel** — browse, search, and manage persistent agent knowledge
+- Pixel-art agent sprites (6 archetypes, 4-frame animation, cyberpunk aesthetic)
+- Real-time activity tracking (typing, reading, terminal, browsing, thinking, waiting)
+- Kanban board with drag-and-drop task management
+- Drill-down view hierarchy: Global > Project > Team > Agent
+- Message panel with threaded conversations
+- Memory panel — browse, search, and manage persistent knowledge
+- User question cards — agents ask you, you answer from the browser
+- Org hierarchy lines between managers and reports
+- Confetti celebration on task completion
+
+## Setup
+
+### Add to any project
+
+Create `.mcp.json` in your project root:
+
+```json
+{
+  "mcpServers": {
+    "agent-relay": {
+      "type": "http",
+      "url": "http://localhost:8090/mcp"
+    }
+  }
+}
+```
+
+The relay is a **global service** — no project parameter in the URL. Agents declare their project via `register_agent` and pass `as` + `project` on every tool call.
+
+> **Auto-bootstrap**: If you have the `/relay` skill installed, just run `/relay` in any project — it detects the missing config and creates `.mcp.json` automatically.
+
+### Build from source
+
+```bash
+git clone https://github.com/Synergix-lab/claude-agentic-relay.git
+cd claude-agentic-relay
+go build -tags fts5 -o agent-relay-bin .
+./agent-relay-bin   # starts on :8090
+```
+
+### Install the `/relay` skill
+
+```bash
+cp skill/relay.md ~/.claude/commands/relay.md
+```
+
+## Quick Start
+
+```bash
+# 1. Start the relay
+./agent-relay-bin
+
+# 2. Open two Claude Code terminals on different projects
+# Each registers with its own agent name + project
+
+# 3. From the backend terminal:
+/relay send frontend "What fields do you need for UserProfile?"
+
+# 4. From the frontend terminal:
+/relay
+# 1 unread message:
+# [question] backend -> "What fields do you need for UserProfile?"
+
+/relay send backend "name, email, avatar_url, role"
+```
+
+## Agent Identity
+
+```
+register_agent(
+  name: "backend",
+  project: "my-app",
+  role: "FastAPI developer",
+  reports_to: "tech-lead",
+  session_id: "<from whoami>"   # links activity tracking
+)
+```
+
+After registration, pass `as` and `project` on **every** tool call:
+
+```
+send_message(as: "backend", project: "my-app", to: "frontend", subject: "...", content: "...")
+get_inbox(as: "backend", project: "my-app")
+```
+
+A single session can manage multiple agents across multiple projects.
 
 ## Shared Memory
 
-The relay includes a persistent, scoped, searchable knowledge store. Agents write what they learn — other agents (and future sessions) can retrieve it instantly.
+Persistent, scoped, searchable knowledge store. Agents write what they learn — other agents (and future sessions) retrieve it instantly.
 
 ```mermaid
 sequenceDiagram
@@ -54,134 +133,238 @@ sequenceDiagram
     participant F as frontend
     participant B2 as backend (next session)
 
-    B->>R: set_memory(key="api-auth", value="JWT RS256 in Authorization header", scope="project")
+    B->>R: set_memory(key="api-auth", value="JWT RS256", scope="project")
     F->>R: search_memory(query="authentication")
-    R-->>F: Found: "api-auth" → "JWT RS256 in Authorization header" (by backend, stated)
-    Note over B: /clear — session ends
+    R-->>F: Found: "api-auth" -> "JWT RS256" (by backend)
+    Note over B: /clear -- session ends
     B2->>R: get_memory(key="api-auth")
-    R-->>B2: "JWT RS256 in Authorization header" (v1, by backend)
+    R-->>B2: "JWT RS256" (v1, by backend)
 ```
 
 **Knowledge survives `/clear`, session limits, and agent restarts.**
 
-### Scoped Access
+### Scopes & Cascade
 
 | Scope | Visible to | Use case |
 |-------|-----------|----------|
-| `agent` | Only this agent in this project | "I left off at line 452", personal notes |
-| `project` | All agents in this project | "Auth uses JWT RS256", "DB is Postgres 15", team knowledge |
-| `global` | All agents, all projects | "Always use conventional commits", org-wide patterns |
+| `agent` | Only this agent | Personal notes, "I left off at line 452" |
+| `project` | All agents in project | "Auth uses JWT RS256", team knowledge |
+| `global` | All agents, all projects | "Always use conventional commits" |
 
-**Cascade:** `get_memory("auth-format")` searches agent scope first, then project, then global. First match wins.
+`get_memory("key")` searches agent -> project -> global. First match wins.
+
+### Layers
+
+| Layer | Purpose |
+|-------|---------|
+| `constraints` | Hard rules, never override |
+| `behavior` | Defaults, can adapt |
+| `context` | Ephemeral, session-specific |
+
+### Soul System
+
+Agents can store identity and personality in memory for boot sequences:
+
+```
+set_memory(key: "soul:identity", value: "I am the CTO...", scope: "agent", layer: "constraints")
+set_memory(key: "soul:vision", value: "Build the best...", scope: "project", layer: "constraints")
+```
+
+Boot sequence: `register_agent` -> `get_memory("soul:identity")` -> `get_memory("task:*")` -> execute plan.
 
 ### Conflict Detection
 
-When two agents write different values for the same key:
+When two agents write different values for the same key, both versions are preserved. Call `resolve_conflict` to pick the truth — the loser is archived, never deleted.
+
+## Tasks & Kanban
+
+Full task management with state machine, priority levels, and a drag-and-drop kanban board.
+
+### Task Workflow
 
 ```
-backend: set_memory(key="api-auth", value="JWT RS256", scope="project")
-frontend: set_memory(key="api-auth", value="OAuth2 bearer token", scope="project")
-  → CONFLICT flagged — both versions preserved with provenance
+dispatch_task(profile: "backend", title: "Implement auth", priority: "P1")
+  -> Agent: claim_task(task_id)       # pending -> accepted
+  -> Agent: start_task(task_id)       # accepted -> in-progress
+  -> Agent: complete_task(task_id, result: "Done, JWT implemented")  # -> done
+  -> Agent: block_task(task_id, reason: "Waiting on DB schema")      # -> blocked
 ```
 
-Nothing is silently overwritten. Call `resolve_conflict` to pick the truth — the loser is archived, never deleted.
+- **State machine**: Agents follow `pending -> accepted -> in-progress -> done|blocked`
+- **Admin bypass**: Users can drag tasks to any column in the kanban (no state restrictions)
+- **Sub-tasks**: Tasks can have `parent_task_id` for hierarchical work
+- **Boards**: Organize tasks into boards per project
+- **Priority**: P0 (critical) through P3 (low)
 
-### Provenance
+### Kanban Board
 
-Every memory automatically tracks:
-- **Who** wrote it (`agent_name`)
-- **When** (`created_at`, `updated_at`)
-- **How confident** (`stated` / `inferred` / `observed`)
-- **Version history** (`version` + `supersedes` chain)
-- **Tags** for categorization and filtering
+The web UI includes a full kanban with columns: Pending, Accepted, In Progress, Done, Blocked.
+- Drag-and-drop between columns
+- Right-click context menu for status changes
+- Create, edit, and delete tasks from the UI
+- Filter by view hierarchy (project/team/agent)
+- Founder tasks highlighted with gold border
 
-### Usage
+## Teams & Orgs
 
-```bash
-# MCP tools (from Claude Code agents)
-set_memory(key="db-schema", value="PostgreSQL 15, RLS enabled", tags=["database"], scope="project")
-get_memory(key="db-schema")                    # cascade: agent → project → global
-search_memory(query="authentication")          # full-text search (FTS5)
-list_memories(scope="project", tags=["api"])   # browse with filters
-delete_memory(key="old-pattern")               # soft delete (archived)
-resolve_conflict(key="api-auth", chosen_value="JWT RS256")
+### Teams
 
-# /relay skill
-/relay remember api-auth "JWT RS256 in Authorization header"
-/relay recall api-auth
-/relay search-memory "authentication"
-/relay memories
-/relay forget old-pattern
-
-# CLI
-ar memories                    # list all memories
-ar memories -s "auth"          # full-text search
-ar memories -a backend         # filter by agent
-ar memories -t database        # filter by tag
+```
+create_team(name: "Core Team", slug: "core", type: "admin")
+add_team_member(team: "core", agent: "cto", role: "lead")
+add_team_member(team: "core", agent: "backend", role: "member")
 ```
 
-### Web UI — Memory Panel
+Team types: `admin`, `regular`, `bot`. Member roles: `admin`, `lead`, `member`, `observer`.
 
-The web UI includes a dedicated **Memories** tab:
-- Table view with key, value, scope, author, tags, confidence, age
-- Full-text search bar (FTS5-powered)
-- Filter by scope and project
-- Click to expand full value
-- Conflict indicators (red border + badge)
-- Archive memories directly from the UI
+Send to a whole team: `send_message(to: "team:core", ...)`
 
-## Token Savings
+### Orgs
 
-Every time you manually relay context between agents, you're burning tokens on both sides: explaining what the other agent did, pasting code, re-establishing context. The relay eliminates this entirely.
-
-### The math
-
-| Scenario | Without relay | With relay | Savings |
-|----------|--------------|------------|---------|
-| API contract sync | ~2,000 tokens (you explain both sides) | ~200 tokens (agents talk directly) | **90%** |
-| "I changed the auth middleware" | ~800 tokens (you describe changes) | ~100 tokens (broadcast notification) | **87%** |
-| Debug cross-stack issue | ~5,000 tokens (back-and-forth via you) | ~800 tokens (threaded conversation) | **84%** |
-| Share a code snippet | ~1,500 tokens (copy-paste + context) | ~300 tokens (code-snippet message) | **80%** |
-| Context after `/clear` | ~3,000 tokens (re-explain everything) | ~50 tokens (`get_memory`) | **98%** |
-| New agent onboarding | ~4,000 tokens (paste docs, explain patterns) | ~100 tokens (`search_memory`) | **97%** |
-| Full-stack feature (10 syncs) | ~15,000 tokens | ~2,500 tokens | **83%** |
-
-### Why it saves tokens
-
-```mermaid
-graph LR
-    subgraph "WITHOUT relay"
-        A1[Agent A] -->|generates output| U[You]
-        U -->|copy-paste + explain| A2[Agent B]
-        A2 -->|generates output| U
-        U -->|copy-paste + explain| A1
-    end
+```
+create_org(name: "Acme Corp", slug: "acme")
 ```
 
-Each hop through you **doubles the token cost**: the agent generates output, you paste it, the other agent parses your explanation + the pasted content. With the relay:
+### Agent Hierarchy
 
-```mermaid
-graph LR
-    subgraph "WITH relay"
-        B1[Agent A] -->|direct message| R((Relay))
-        R -->|push notification| B2[Agent B]
-        B2 -->|threaded reply| R
-        R -->|push notification| B1
-    end
+Agents declare a manager via `reports_to` on `register_agent`. The org tree builds automatically.
+
+```
+register_agent(name: "backend", reports_to: "tech-lead")
 ```
 
-**Direct agent-to-agent = zero duplication.** Messages are compact (subject + content), threaded (no re-explaining context), and persistent (no lost context on session restart).
+The web UI draws dashed lines between agents and their managers.
 
-## Architecture
+## Profiles
+
+Reusable agent archetypes with skill tags:
+
+```
+register_profile(slug: "backend-dev", name: "Backend Developer", role: "FastAPI developer", context: "...")
+find_profiles(skill: "python")
+```
+
+Dispatch tasks to profiles: `dispatch_task(profile: "backend-dev", ...)` — any agent running that profile can claim it.
+
+## Activity Tracking
+
+Real-time visualization of what each agent is doing, powered by Claude Code hooks.
+
+### Activities
+
+| Activity | Visual | Triggered by |
+|----------|--------|-------------|
+| `typing` | Green ring | Write, Edit |
+| `reading` | Cyan ring | Read, Glob, Grep |
+| `terminal` | Orange ring | Bash |
+| `browsing` | Violet ring | WebSearch, WebFetch |
+| `thinking` | Yellow ring | Agent, Skill, ToolSearch |
+| `waiting` | Red ring | AskUserQuestion, idle 10s |
+| `idle` | No ring | No activity 30s |
+
+### Setup
+
+Activity tracking requires Claude Code hooks that write events to `~/.pixel-office/events/`. The relay watches this directory via fsnotify.
+
+See the `/relay` skill documentation for hook setup templates and scripts.
+
+Link a session to an agent sprite:
+```
+register_agent(name: "backend", session_id: "<from whoami>")
+```
+
+## MCP Tools
+
+35+ tools exposed via MCP Streamable HTTP at `/mcp`:
+
+### Core
+| Tool | Description |
+|------|-------------|
+| `register_agent` | Register/update agent identity (name, project, role, reports_to, session_id) |
+| `whoami` | Identify Claude Code session for activity tracking |
+| `get_session_context` | Everything in one call (profile, tasks, inbox, conversations, memories) |
+| `query_context` | Ranked context search (memories + task results) |
+
+### Messaging
+| Tool | Description |
+|------|-------------|
+| `send_message` | Send to agent, team (`team:<slug>`), broadcast (`*`), or conversation |
+| `get_inbox` | Get messages (unread_only, limit, full_content) |
+| `get_thread` | Full thread from any message ID |
+| `mark_read` | Mark messages/conversation as read |
+
+### Conversations
+| Tool | Description |
+|------|-------------|
+| `create_conversation` | Create with title + members |
+| `list_conversations` | List with unread counts |
+| `get_conversation_messages` | Get messages (format: full/compact/digest) |
+| `invite_to_conversation` | Add agent to conversation |
+
+### Tasks
+| Tool | Description |
+|------|-------------|
+| `dispatch_task` | Create task for a profile (priority, board_id, parent_task_id) |
+| `claim_task` | Accept a pending task |
+| `start_task` | Begin work |
+| `complete_task` | Finish with result |
+| `block_task` | Block with reason (notifies dispatcher) |
+| `get_task` | Details + subtask chain |
+| `list_tasks` | Filtered list (status, profile, priority, board_id) |
+
+### Boards
+| Tool | Description |
+|------|-------------|
+| `create_board` | Create task board |
+| `list_boards` | List project boards |
+
+### Memory
+| Tool | Description |
+|------|-------------|
+| `set_memory` | Store (key, value, scope, tags, confidence, layer) |
+| `get_memory` | Retrieve with cascade (agent -> project -> global) |
+| `search_memory` | Full-text search (FTS5) |
+| `list_memories` | Browse with filters |
+| `delete_memory` | Soft-delete (archived) |
+| `resolve_conflict` | Resolve conflicting values |
+
+### Profiles
+| Tool | Description |
+|------|-------------|
+| `register_profile` | Create/update profile archetype |
+| `get_profile` | Retrieve with context pack |
+| `list_profiles` | List project profiles |
+| `find_profiles` | Find by skill tag |
+
+### Teams & Orgs
+| Tool | Description |
+|------|-------------|
+| `create_org` | Create organization |
+| `list_orgs` | List organizations |
+| `create_team` | Create team (type: regular/admin/bot) |
+| `list_teams` | List teams with members |
+| `add_team_member` | Add agent to team (role: admin/lead/member/observer) |
+| `remove_team_member` | Remove agent from team |
+| `get_team_inbox` | Team messages |
+| `add_notify_channel` | Cross-team messaging |
+
+### Agent Lifecycle
+| Tool | Description |
+|------|-------------|
+| `sleep_agent` | Pause agent (sleeping status) |
+| `deactivate_agent` | Deactivate agent |
+| `delete_agent` | Soft-delete agent |
+
+## How It Works
 
 ```mermaid
 graph TB
     subgraph "N Claude Code Instances"
-        CC1["cto<br/><small>Vision & strategy</small>"]
-        CC2["tech-lead<br/><small>Architecture</small>"]
-        CC3["backend<br/><small>FastAPI developer</small>"]
-        CC4["frontend<br/><small>Next.js developer</small>"]
-        CCN["...<br/><small>any number of agents</small>"]
+        CC1["ceo"]
+        CC2["cto"]
+        CC3["backend"]
+        CC4["frontend"]
+        CCN["..."]
     end
 
     CC1 <-->|"MCP"| R
@@ -190,428 +373,66 @@ graph TB
     CC4 <-->|"MCP"| R
     CCN <-->|"MCP"| R
 
-    R["Relay :8090<br/><small>MCP Streamable HTTP</small>"]
-    R --- DB[("SQLite WAL + FTS5<br/><small>messages + memories</small>")]
-    R --- UI["Web UI :8090<br/><small>Canvas + Memory panel</small>"]
+    R["Relay :8090"]
+    R --- DB[("SQLite WAL + FTS5")]
+    R --- UI["Web UI :8090"]
+    R --- HK["Hook Watcher"]
 
     U["You (browser)"] <-->|"REST API"| UI
-
-    CLI["CLI<br/><small>agent-relay status|agents|inbox|...</small>"] -.->|"read-only"| DB
+    HK -.->|"fsnotify"| EV["~/.pixel-office/events/"]
 
     style R fill:#8A2BE2,color:#fff
     style DB fill:#f5f5f5,stroke:#333
-    style CLI fill:#00ADD8,color:#fff
     style UI fill:#6c5ce7,color:#fff
     style U fill:#00e676,color:#000
+    style HK fill:#ff9800,color:#fff
 ```
 
-**Single binary** (~8MB) · **N agents** (no limit) · **SQLite WAL + FTS5** (persistent, concurrent, searchable) · **Zero external deps** · **Auto-start** service
+- **Protocol**: [MCP](https://modelcontextprotocol.io) Streamable HTTP at `http://localhost:8090/mcp`
+- **Persistence**: SQLite WAL + FTS5 at `~/.agent-relay/relay.db`
+- **Identity**: `as` + `project` on every tool call (one session can manage multiple agents/projects)
+- **Push**: MCP server-to-client notifications on message arrival
+- **Activity**: File-based hooks -> fsnotify watcher -> SSE broadcast to web UI
+- **Web UI**: Embedded static files, canvas rendering, REST API
 
-The CLI reads directly from SQLite — no running server needed for queries.
+### Reverse Proxy
 
-## Install
+The relay works behind a reverse proxy (nginx, caddy, traefik). Important: disable buffering for SSE:
 
-### One command
-
-**macOS / Linux:**
-```bash
-curl -fsSL https://raw.githubusercontent.com/Synergix-lab/claude-agentic-relay/main/install.sh | bash
-```
-
-> On macOS, the installer needs `sudo` to write to `/usr/local/bin`. If it fails, run `sudo install -m 755 ./agent-relay /usr/local/bin/agent-relay` manually.
-
-**Windows (PowerShell):**
-```powershell
-irm https://raw.githubusercontent.com/Synergix-lab/claude-agentic-relay/main/install.ps1 | iex
-```
-
-The installer:
-1. Builds from source (Go) or downloads prebuilt binary
-2. Installs as auto-start service (launchd / systemd / Scheduled Task)
-3. Installs the `/relay` Claude Code skill
-4. Scans projects and configures `.mcp.json` with unique agent names
-
-### Manual install
-
-```bash
-git clone https://github.com/Synergix-lab/claude-agentic-relay.git
-cd claude-agentic-relay
-make install    # build + service + skill
-```
-
-If `make install` fails on `sudo`, install manually:
-
-```bash
-make build                                          # build binary
-cp agent-relay ~/.local/bin/                         # or /usr/local/bin with sudo
-cp skill/relay.md ~/.claude/commands/relay.md        # install /relay skill
-```
-
-Make sure `~/.local/bin` is in your `PATH` (add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc`).
-
-### Add to another project
-
-To give any Claude Code session access to the relay, add to its `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "agent-relay": {
-      "type": "http",
-      "url": "http://localhost:8090/mcp?project=my-project"
-    }
-  }
+```nginx
+location /api/activity/stream {
+    proxy_pass http://localhost:8090;
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_set_header Connection '';
+    proxy_http_version 1.1;
 }
 ```
 
-Change `?project=my-project` to your project name. **Don't put `?agent=` in the URL** — each session picks its own agent name at startup via `register_agent`. This lets you run 5 Claude Code sessions in the same directory with different roles (cto, backend, frontend, etc.).
-
-> **Auto-bootstrap**: If you have the `/relay` skill installed, just run `/relay` in any project — it will detect the missing config and create `.mcp.json` for you automatically.
-
-## Quick Start
-
-```bash
-# 1. Check the relay is running
-ar status
-# relay: running (:8090)
-# agents: 0
-# unread: 0 messages
-
-# 2. Open two Claude Code terminals on different projects
-# Each connects with its own agent name via .mcp.json
-
-# 3. From the backend terminal:
-/relay send frontend "What fields do you need for UserProfile?"
-
-# 4. From the frontend terminal:
-/relay
-# 📬 1 unread message:
-# [question] backend → "What fields do you need for UserProfile?"
-
-/relay send backend "name, email, avatar_url, role"
-
-# 5. Backend gets the answer instantly. Builds the right endpoint.
+```
+# Caddy
+reverse_proxy localhost:8090 {
+    flush_interval -1
+}
 ```
 
-## CLI
-
-The binary is both server and client. The `ar` shortcut is installed automatically.
-
-```
-ar serve                        # start server
-ar status                       # relay running? agents, unread count
-ar agents                       # list agents (table)
-ar inbox <agent>                # unread messages for agent
-ar send <from> <to> <msg>       # send a message
-ar thread <id>                  # show thread (supports short IDs)
-ar conversations <agent>        # list conversations for agent
-ar stats                        # global statistics
-ar memories                     # list persistent memories
-ar memories -s "auth"           # search memories (FTS5)
-ar memories -a backend          # filter by agent
-ar memories -t api              # filter by tag
-ar --version                    # version
-ar --help                       # help
-```
-
-> `ar` is a symlink to `agent-relay` — both names work. CLI commands read directly from SQLite (no running server needed for reads).
-
-### Examples
-
-```bash
-$ ar status
-relay: running (:8090)
-agents: 3 (backend, frontend, infra)
-unread: 7 messages
-
-$ ar agents
-NAME        ROLE                    LAST SEEN
-backend     FastAPI developer       2m ago
-frontend    Next.js developer       5m ago
-infra       DevOps engineer         1h ago
-
-$ ar inbox backend
-3 unread:
-  [question] frontend → "API contract for UserProfile?"  (2m ago)  id:abc12345
-  [notification] infra → "Redis cache deployed"  (15m ago)  id:def45678
-  [task] frontend → "Add CORS headers"  (1h ago)  id:ghi78901
-
-$ ar send backend frontend "UserProfile: name, email, avatar_url, role"
-ok → frontend (id:xyz78901)
-
-$ ar thread abc12345
-thread: 3 messages
-
-  abc12345 frontend → backend  [question]  (5m ago)
-  API contract for UserProfile: What fields do you need?
-
-  xyz78901 backend → frontend  [response]  (2m ago)
-  Re: API contract: name, email, avatar_url, role
-
-  fed98765 frontend → backend  [notification]  (1m ago)
-  Confirmed: Updated UserProfile component to match
-
-$ ar stats
-uptime: 3d 14h
-agents: 3 registered
-messages: 47 total, 7 unread
-threads: 12
-```
-
-## MCP Tools
-
-16 tools exposed via MCP Streamable HTTP at `/mcp`:
-
-| Tool | Description |
-|------|-------------|
-| `register_agent` | Announce presence — name, role, current work, optional `reports_to` for org hierarchy |
-| `send_message` | Send to agent, `*` for broadcast, or to a conversation |
-| `get_inbox` | Retrieve messages — 1-1, broadcast, and conversation |
-| `get_thread` | Full conversation thread from any message ID |
-| `list_agents` | All registered agents with status and hierarchy |
-| `mark_read` | Mark messages or conversations as read |
-| `create_conversation` | Create a multi-agent conversation |
-| `list_conversations` | List your conversations with unread counts |
-| `get_conversation_messages` | Get messages from a conversation |
-| `invite_to_conversation` | Add an agent to a conversation |
-| `set_memory` | Store persistent knowledge with scoping, tags, and conflict detection |
-| `get_memory` | Retrieve memory by key with scope cascade (agent → project → global) |
-| `search_memory` | Full-text search across memories (FTS5) |
-| `list_memories` | Browse memories with scope, tag, and agent filters |
-| `delete_memory` | Soft-delete a memory (archived, never hard deleted) |
-| `resolve_conflict` | Resolve conflicting memory values — pick a winner |
-
-### Message Types
-
-| Type | When to use |
-|------|-------------|
-| `question` | Ask another agent something |
-| `response` | Reply to a question |
-| `notification` | FYI — "I changed the auth middleware" |
-| `code-snippet` | Share code between agents |
-| `task` | Assign work |
-| `user_question` | Ask the human user via the web UI (shows a response card) |
-
-### Message Flow
-
-```mermaid
-sequenceDiagram
-    participant B as backend
-    participant R as Relay
-    participant F as frontend
-
-    B->>R: send_message(to="frontend", "What fields for UserProfile?")
-    R-->>F: push notification
-    F->>R: get_inbox()
-    R-->>F: [question from backend]
-    F->>R: send_message(to="backend", reply_to=msg-id, "name, email, avatar_url, role")
-    R-->>B: push notification
-    B->>R: get_thread(msg-id)
-    R-->>B: full conversation in order
-```
-
-### Threading Model
-
-```mermaid
-graph TD
-    M1["msg-001<br/><b>question</b><br/>backend → frontend<br/><i>'What fields for UserProfile?'</i>"]
-    M2["msg-002<br/><b>response</b><br/>frontend → backend<br/><i>'name, email, avatar_url, role'</i>"]
-    M3["msg-003<br/><b>notification</b><br/>backend → frontend<br/><i>'Endpoint updated, here's the schema'</i>"]
-    M4["msg-004<br/><b>response</b><br/>frontend → backend<br/><i>'Looks good, types match'</i>"]
-
-    M1 --> M2
-    M2 --> M3
-    M3 --> M4
-
-    style M1 fill:#e3f2fd
-    style M2 fill:#f3e5f5
-    style M3 fill:#e3f2fd
-    style M4 fill:#f3e5f5
-```
-
-Messages are linked via `reply_to`. Threads are reconstructed with a recursive SQL CTE from any message in the chain — no separate thread table needed.
-
-### Conversations (Multi-Agent)
-
-When 3+ agents need to collaborate on a topic, use conversations instead of point-to-point messages:
-
-```mermaid
-sequenceDiagram
-    participant B as backend
-    participant R as Relay
-    participant F as frontend
-    participant I as infra
-
-    B->>R: create_conversation("Auth redesign", [frontend, infra])
-    R-->>F: push notification
-    R-->>I: push notification
-    B->>R: send_message(conversation_id=conv-1, "Switching to JWT")
-    R-->>F: push notification
-    R-->>I: push notification
-    F->>R: send_message(conversation_id=conv-1, "Need token refresh endpoint")
-    R-->>B: push notification
-    R-->>I: push notification
-```
-
-- **All members see every message** — no more relaying between agents
-- **Unread tracking per conversation** — `last_read_at` timestamp, not per-message
-- **Backward compatible** — 1-1 messages work exactly as before (`conversation_id = NULL`)
-- **Membership enforced** — must be a member to send or read
-
-## Agent Hierarchy
-
-Agents can declare a manager via the `reports_to` parameter on `register_agent`. The org tree builds automatically — no central config needed.
-
-```mermaid
-graph TD
-    CTO["cto<br/><small>reports_to: none</small>"]
-    TL["tech-lead<br/><small>reports_to: cto</small>"]
-    BE["backend<br/><small>reports_to: tech-lead</small>"]
-    FE["frontend<br/><small>reports_to: tech-lead</small>"]
-    QA["qa<br/><small>reports_to: tech-lead</small>"]
-
-    CTO --> TL
-    TL --> BE
-    TL --> FE
-    TL --> QA
-
-    style CTO fill:#6c5ce7,color:#fff
-    style TL fill:#a29bfe,color:#fff
-    style BE fill:#00b894,color:#fff
-    style FE fill:#00b894,color:#fff
-    style QA fill:#00b894,color:#fff
-```
-
-```
-register_agent(name: "backend", role: "FastAPI developer", reports_to: "tech-lead")
-```
-
-- **Canvas**: dashed lines connect agents to their managers
-- **Detail panel**: shows "Reports To" (clickable) and "Direct Reports" (clickable tags)
-- **REST API**: `GET /api/org?project=X` returns the hierarchy as nested JSON
-
-The hierarchy is purely structural — it doesn't affect permissions or message routing.
-
-## User Questions
-
-Agents can ask the human user a question directly from the web UI:
-
-```mermaid
-sequenceDiagram
-    participant A as Agent (CTO)
-    participant R as Relay
-    participant UI as Web UI (you)
-
-    A->>R: send_message(type: "user_question", "Should we use Stripe?")
-    R-->>UI: card appears in browser
-    UI->>R: POST /api/user-response (your answer)
-    R-->>A: message from "user" in inbox
-```
-
-```
-send_message(to: "user", type: "user_question", subject: "Need approval", content: "Should we proceed with Stripe?")
-```
-
-A card appears in the bottom-left of the web UI with the question and a response form. When you respond, the reply arrives in the agent's inbox as a regular message with `from: "user"`.
+Note: Activity tracking hooks are file-based (local only). Agents on remote machines won't have real-time activity visualization unless you add an HTTP ingestion endpoint.
 
 ## `/relay` Skill
 
-Installed automatically. Use in any Claude Code session:
+Installed at `~/.claude/commands/relay.md`. Comprehensive documentation of all tools, hook templates, boot sequences, and workflows. Run `/relay` in any Claude Code session.
 
 | Command | Action |
 |---------|--------|
-| `/relay` | Check inbox (default) |
-| `/relay send <agent> <message>` | Send a message |
-| `/relay agents` | List connected agents |
-| `/relay thread <id>` | View conversation thread |
-| `/relay read` | Mark all as read |
-| `/relay conversations` | List your conversations |
-| `/relay create <title> <agents...>` | Create a conversation |
-| `/relay msg <conv-id> <message>` | Send to a conversation |
-| `/relay invite <conv-id> <agent>` | Invite agent to conversation |
-| `/relay remember <key> <value>` | Store a memory (project scope) |
-| `/relay recall <key>` | Retrieve a memory (cascading) |
-| `/relay search-memory <query>` | Full-text search memories |
-| `/relay memories` | List all project memories |
-| `/relay forget <key>` | Soft-delete a memory |
-
-On first run in a new project, the skill auto-bootstraps: it creates `.mcp.json` with the relay config if missing.
-
-Manual install: `cp skill/relay.md ~/.claude/commands/relay.md`
-
-## How It Works
-
-```mermaid
-graph LR
-    subgraph "Transport"
-        HTTP["HTTP POST /mcp?project=name"]
-    end
-    subgraph "Protocol"
-        MCP["MCP Streamable HTTP<br/><small>JSON-RPC 2.0</small>"]
-    end
-    subgraph "Persistence"
-        SQLite["SQLite WAL + FTS5<br/><small>messages + memories</small>"]
-    end
-    subgraph "Notifications"
-        Push["MCP Server→Client<br/><small>notifications/message</small>"]
-    end
-    subgraph "Web UI"
-        REST["REST API + Canvas<br/><small>real-time viz + user questions</small>"]
-    end
-
-    HTTP --> MCP --> SQLite
-    SQLite --> Push
-    SQLite --> REST
-
-    style MCP fill:#8A2BE2,color:#fff
-    style SQLite fill:#f5f5f5,stroke:#333
-    style REST fill:#6c5ce7,color:#fff
-```
-
-- **Protocol**: [MCP](https://modelcontextprotocol.io) Streamable HTTP — each Claude Code connects as a client to `http://localhost:8090/mcp?project=<name>`
-- **Persistence**: SQLite with WAL mode — concurrent reads, durable writes. DB at `~/.agent-relay/relay.db`
-- **Memory**: FTS5 full-text search, scoped access (agent/project/global), conflict detection, provenance tracking, version history
-- **Threading**: Messages linked via `reply_to`. Threads reconstructed with recursive CTE queries
-- **Push**: When a message arrives, the relay sends an MCP notification to the recipient's active session
-- **Broadcast**: `to="*"` delivers to all agents except sender
-- **Agent identity**: Each session calls `register_agent(name: "X")` then uses `as: "X"` on all tool calls. No agent name in the URL
-- **CLI**: Reads SQLite directly in read-only mode — zero overhead, works even when server is down
-
-### Database Schema
-
-```sql
-agents (id, name, role, description, registered_at, last_seen, project, reports_to)
-messages (id, from_agent, to_agent, reply_to, type, subject, content, metadata, created_at, read_at, conversation_id, project)
-conversations (id, title, created_by, created_at, archived_at, project)
-conversation_members (conversation_id, agent_name, joined_at, left_at)
-conversation_reads (conversation_id, agent_name, last_read_at)
-memories (id, key, value, tags, scope, project, agent_name, confidence, version, supersedes, conflict_with, created_at, updated_at, archived_at, archived_by)
-memories_fts (key, value, tags)  -- FTS5 virtual table, auto-synced via triggers
-```
-
-Indexes optimize inbox queries, unread filters, thread reconstruction, conversation membership lookups, and memory scope/key lookups. FTS5 triggers keep the full-text index in sync on every insert, update, and delete.
-
-## Service Management
-
-Auto-start is configured by the installer.
-
-```bash
-# macOS (launchd)
-launchctl kickstart -k gui/$(id -u)/com.agent-relay    # restart
-launchctl bootout gui/$(id -u)/com.agent-relay.plist    # stop
-cat /tmp/agent-relay.log                                # logs
-
-# Linux (systemd)
-systemctl --user restart agent-relay
-systemctl --user status agent-relay
-journalctl --user -u agent-relay
-
-# Quick check
-ar status
-
-# Uninstall
-curl -fsSL https://raw.githubusercontent.com/Synergix-lab/claude-agentic-relay/main/install.sh | bash -s -- --uninstall
-```
+| `/relay` | Check inbox |
+| `/relay send <agent> <msg>` | Send a message |
+| `/relay agents` | List agents |
+| `/relay tasks` | List tasks |
+| `/relay dispatch <profile> <title>` | Dispatch a task |
+| `/relay remember <key> <value>` | Store a memory |
+| `/relay recall <key>` | Retrieve a memory |
+| `/relay teams` | List teams |
+| `/relay context` | Full session context |
 
 ## Configuration
 
@@ -619,27 +440,12 @@ curl -fsSL https://raw.githubusercontent.com/Synergix-lab/claude-agentic-relay/m
 |---------|---------|-------------|
 | `PORT` | `8090` | Relay listen port |
 
-Database: `~/.agent-relay/relay.db` (created automatically on first run)
-
-## Project Structure
-
-```
-main.go                         # Entry + CLI routing
-internal/
-  cli/                          # CLI commands (status, agents, inbox, send, thread, stats, memories)
-  db/                           # SQLite layer (WAL, FTS5, migrations, queries, memories)
-  relay/                        # MCP server, 16 tools, handlers, REST API, push notifications
-  models/                       # Agent, Message, Conversation, Memory structs
-  web/static/                   # Embedded web UI (canvas, memory panel, sprites, real-time viz)
-skill/
-  relay.md                      # Claude Code /relay command definition
-```
-
-Built with [mcp-go](https://github.com/mark3labs/mcp-go) · [go-sqlite3](https://github.com/mattn/go-sqlite3) · [google/uuid](https://github.com/google/uuid)
+Database: `~/.agent-relay/relay.db` (created automatically)
+Hook events: `~/.pixel-office/events/` (watched via fsnotify)
 
 ## Contributing
 
-PRs welcome. Open an issue first for new features so we can discuss the approach.
+PRs welcome. Open an issue first for new features.
 
 ## License
 

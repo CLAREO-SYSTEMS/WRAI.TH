@@ -34,10 +34,11 @@ func New(database *db.DB, ingester *ingest.Ingester) *Relay {
 	)
 
 	registry := NewSessionRegistry(mcpSrv)
-	handlers := NewHandlers(database, registry)
+	handlers := NewHandlers(database, registry, ingester)
 
 	// Register all tools
 	mcpSrv.AddTools(
+		server.ServerTool{Tool: whoamiTool(), Handler: handlers.HandleWhoami},
 		server.ServerTool{Tool: registerAgentTool(), Handler: handlers.HandleRegisterAgent},
 		server.ServerTool{Tool: sendMessageTool(), Handler: handlers.HandleSendMessage},
 		server.ServerTool{Tool: getInboxTool(), Handler: handlers.HandleGetInbox},
@@ -55,6 +56,39 @@ func New(database *db.DB, ingester *ingest.Ingester) *Relay {
 		server.ServerTool{Tool: listMemoriesTool(), Handler: handlers.HandleListMemories},
 		server.ServerTool{Tool: deleteMemoryTool(), Handler: handlers.HandleDeleteMemory},
 		server.ServerTool{Tool: resolveConflictTool(), Handler: handlers.HandleResolveConflict},
+		// Profile tools
+		server.ServerTool{Tool: registerProfileTool(), Handler: handlers.HandleRegisterProfile},
+		server.ServerTool{Tool: getProfileTool(), Handler: handlers.HandleGetProfile},
+		server.ServerTool{Tool: listProfilesTool(), Handler: handlers.HandleListProfiles},
+		server.ServerTool{Tool: findProfilesTool(), Handler: handlers.HandleFindProfiles},
+		// Task tools
+		server.ServerTool{Tool: dispatchTaskTool(), Handler: handlers.HandleDispatchTask},
+		server.ServerTool{Tool: claimTaskTool(), Handler: handlers.HandleClaimTask},
+		server.ServerTool{Tool: startTaskTool(), Handler: handlers.HandleStartTask},
+		server.ServerTool{Tool: completeTaskTool(), Handler: handlers.HandleCompleteTask},
+		server.ServerTool{Tool: blockTaskTool(), Handler: handlers.HandleBlockTask},
+		server.ServerTool{Tool: getTaskTool(), Handler: handlers.HandleGetTask},
+		server.ServerTool{Tool: listTasksTool(), Handler: handlers.HandleListTasks},
+		// Boards
+		server.ServerTool{Tool: createBoardTool(), Handler: handlers.HandleCreateBoard},
+		server.ServerTool{Tool: listBoardsTool(), Handler: handlers.HandleListBoards},
+		// Agent lifecycle
+		server.ServerTool{Tool: deactivateAgentTool(), Handler: handlers.HandleDeactivateAgent},
+		server.ServerTool{Tool: deleteAgentTool(), Handler: handlers.HandleDeleteAgent},
+		server.ServerTool{Tool: sleepAgentTool(), Handler: handlers.HandleSleepAgent},
+		// Soul RAG
+		server.ServerTool{Tool: queryContextTool(), Handler: handlers.HandleQueryContext},
+		// Session context
+		server.ServerTool{Tool: getSessionContextTool(), Handler: handlers.HandleGetSessionContext},
+		// Teams + Orgs
+		server.ServerTool{Tool: createOrgTool(), Handler: handlers.HandleCreateOrg},
+		server.ServerTool{Tool: listOrgsTool(), Handler: handlers.HandleListOrgs},
+		server.ServerTool{Tool: createTeamTool(), Handler: handlers.HandleCreateTeam},
+		server.ServerTool{Tool: listTeamsTool(), Handler: handlers.HandleListTeams},
+		server.ServerTool{Tool: addTeamMemberTool(), Handler: handlers.HandleAddTeamMember},
+		server.ServerTool{Tool: removeTeamMemberTool(), Handler: handlers.HandleRemoveTeamMember},
+		server.ServerTool{Tool: getTeamInboxTool(), Handler: handlers.HandleGetTeamInbox},
+		server.ServerTool{Tool: addNotifyChannelTool(), Handler: handlers.HandleAddNotifyChannel},
 	)
 
 	httpSrv := server.NewStreamableHTTPServer(

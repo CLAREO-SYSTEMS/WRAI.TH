@@ -1,5 +1,5 @@
 class Particle {
-  constructor(x, y, color, vx, vy, life, size) {
+  constructor(x, y, color, vx, vy, life, size, gravity = 60) {
     this.x = x;
     this.y = y;
     this.color = color;
@@ -8,7 +8,7 @@ class Particle {
     this.life = life;
     this.maxLife = life;
     this.size = size;
-    this.gravity = 60;
+    this.gravity = gravity;
   }
 
   get alive() {
@@ -42,7 +42,7 @@ export class ParticleEmitter {
     this.particles = [];
   }
 
-  emit(type, x, y) {
+  emit(type, x, y, extra) {
     if (type === "spawn") {
       const colors = ["#00e676", "#69f0ae", "#b9f6ca", "#00c853"];
       for (let i = 0; i < 12; i++) {
@@ -56,6 +56,25 @@ export class ParticleEmitter {
             Math.sin(angle) * speed - 20,
             0.8 + Math.random() * 0.4,
             2 + Math.random() * 2
+          )
+        );
+      }
+    } else if (type === "arrival") {
+      // Message arrival burst — ring of particles (no gravity)
+      const color = extra || "#74b9ff";
+      const colors = [color, "#ffffff", color, "#e0e0e8"];
+      for (let i = 0; i < 10; i++) {
+        const angle = (Math.PI * 2 * i) / 10 + Math.random() * 0.3;
+        const speed = 25 + Math.random() * 35;
+        this.particles.push(
+          new Particle(
+            x, y,
+            colors[Math.floor(Math.random() * colors.length)],
+            Math.cos(angle) * speed,
+            Math.sin(angle) * speed,
+            0.4 + Math.random() * 0.3,
+            1.5 + Math.random() * 1.5,
+            0  // no gravity — expand uniformly
           )
         );
       }

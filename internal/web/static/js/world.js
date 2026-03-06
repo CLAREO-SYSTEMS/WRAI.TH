@@ -1,40 +1,110 @@
 /**
  * WorldBackground — rendered without camera transform (fills viewport).
- * Draws the gradient and grid.
+ * Retro-Futurism / Cyberpunk aesthetic:
+ *   - Deep dark gradient (#0F0F23 base per design system)
+ *   - Perspective grid with vanishing point
+ *   - Subtle CRT scanlines overlay
+ *   - Floating neon particles
  */
 export class WorldBackground {
   constructor() {
     this.y = -Infinity; // Always behind everything
     this.isBackground = true;
+    this._phase = 0;
+    this._particles = [];
+    // Pre-generate ambient particles
+    for (let i = 0; i < 30; i++) {
+      this._particles.push({
+        x: Math.random(),
+        y: Math.random(),
+        size: 0.5 + Math.random() * 1.5,
+        speed: 0.005 + Math.random() * 0.015,
+        hue: [0, 180, 270, 300][Math.floor(Math.random() * 4)], // cyan, blue, purple, pink
+        alpha: 0.1 + Math.random() * 0.3,
+        drift: (Math.random() - 0.5) * 0.003,
+      });
+    }
   }
 
-  update() {}
+  update(dt) {
+    this._phase += dt;
+    for (const p of this._particles) {
+      p.y -= p.speed * dt;
+      p.x += p.drift * dt;
+      if (p.y < -0.02) {
+        p.y = 1.02;
+        p.x = Math.random();
+      }
+      if (p.x < 0) p.x = 1;
+      if (p.x > 1) p.x = 0;
+    }
+  }
 
   render(ctx, w, h) {
-    // Dark gradient background
+    // --- Deep cyberpunk gradient ---
     const grad = ctx.createLinearGradient(0, 0, 0, h);
-    grad.addColorStop(0, "#0a0a12");
-    grad.addColorStop(1, "#0f0f1a");
+    grad.addColorStop(0, "#0F0F23");
+    grad.addColorStop(0.5, "#0a0a18");
+    grad.addColorStop(1, "#0d0b1a");
     ctx.fillStyle = grad;
     ctx.fillRect(0, 0, w, h);
 
-    // Subtle grid
-    ctx.strokeStyle = "rgba(255,255,255,0.025)";
-    ctx.lineWidth = 1;
-    const gridSize = 40;
+    // --- Perspective grid (vanishing point at center-top) ---
+    const vpX = w / 2;
+    const vpY = h * 0.15;
+    ctx.save();
 
-    for (let x = 0; x < w; x += gridSize) {
-      ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, h);
-      ctx.stroke();
-    }
-    for (let y = 0; y < h; y += gridSize) {
+    // Horizontal lines with perspective fade
+    const horizLines = 20;
+    for (let i = 0; i < horizLines; i++) {
+      const t = (i + 1) / horizLines;
+      const y = vpY + (h - vpY) * (t * t); // quadratic for perspective
+      const alpha = 0.015 + t * 0.04;
+      ctx.strokeStyle = `rgba(108, 92, 231, ${alpha})`;
+      ctx.lineWidth = 0.5 + t * 0.5;
       ctx.beginPath();
       ctx.moveTo(0, y);
       ctx.lineTo(w, y);
       ctx.stroke();
     }
+
+    // Vertical lines converging to vanishing point
+    const vertLines = 16;
+    for (let i = 0; i <= vertLines; i++) {
+      const t = i / vertLines;
+      const bottomX = t * w;
+      const alpha = 0.01 + 0.03 * (1 - Math.abs(t - 0.5) * 2);
+      ctx.strokeStyle = `rgba(108, 92, 231, ${alpha})`;
+      ctx.lineWidth = 0.5;
+      ctx.beginPath();
+      ctx.moveTo(vpX, vpY);
+      ctx.lineTo(bottomX, h);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // --- Ambient floating particles ---
+    ctx.save();
+    for (const p of this._particles) {
+      const px = p.x * w;
+      const py = p.y * h;
+      const flicker = 0.7 + 0.3 * Math.sin(this._phase * 2 + p.x * 10);
+      ctx.globalAlpha = p.alpha * flicker;
+      ctx.fillStyle = `hsl(${p.hue}, 100%, 70%)`;
+      ctx.beginPath();
+      ctx.arc(px, py, p.size, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+
+    // --- Subtle CRT scanlines ---
+    ctx.save();
+    ctx.globalAlpha = 0.03;
+    for (let y = 0; y < h; y += 3) {
+      ctx.fillStyle = "#000";
+      ctx.fillRect(0, y, w, 1);
+    }
+    ctx.restore();
   }
 }
 
@@ -91,11 +161,9 @@ export class World {
         // Find cluster center for this link
         let anchorX = 0, anchorY = 0;
         if (this.clusters.length > 0) {
-          // Use the cluster that the manager belongs to
           const closest = this.clusters[0];
           anchorX = closest.cx;
           anchorY = closest.cy;
-          // Try to find exact cluster by proximity
           for (const c of this.clusters) {
             const d1 = Math.hypot(mx - c.cx, my - c.cy);
             const d2 = Math.hypot(mx - anchorX, my - anchorY);

@@ -1,11 +1,16 @@
 package relay
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"agent-relay/internal/db"
+	"agent-relay/internal/ingest"
 	"agent-relay/internal/models"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -14,14 +19,80 @@ import (
 type Handlers struct {
 	db       *db.DB
 	registry *SessionRegistry
+	ingester *ingest.Ingester
 }
 
-func NewHandlers(db *db.DB, registry *SessionRegistry) *Handlers {
-	return &Handlers{db: db, registry: registry}
+func NewHandlers(db *db.DB, registry *SessionRegistry, ingester *ingest.Ingester) *Handlers {
+	return &Handlers{db: db, registry: registry, ingester: ingester}
+}
+
+// HandleWhoami finds the caller's Claude Code session by grepping transcripts for a unique salt.
+func (h *Handlers) HandleWhoami(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	salt := req.GetString("salt", "")
+	if salt == "" {
+		return mcp.NewToolResultError("salt is required"), nil
+	}
+	if len(salt) < 5 {
+		return mcp.NewToolResultError("salt too short — use at least 3 random words"), nil
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return mcp.NewToolResultError("cannot determine home dir"), nil
+	}
+
+	claudeDir := filepath.Join(home, ".claude", "projects")
+	var matchFile string
+
+	// Walk all .jsonl transcript files
+	_ = filepath.Walk(claudeDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".jsonl") {
+			return nil
+		}
+		if matchFile != "" {
+			return filepath.SkipAll
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return nil
+		}
+		defer f.Close()
+
+		// Scan from the end — salt is in recent lines. Read last 64KB.
+		stat, _ := f.Stat()
+		offset := stat.Size() - 65536
+		if offset < 0 {
+			offset = 0
+		}
+		f.Seek(offset, 0)
+
+		scanner := bufio.NewScanner(f)
+		scanner.Buffer(make([]byte, 256*1024), 256*1024)
+		for scanner.Scan() {
+			if strings.Contains(scanner.Text(), salt) {
+				matchFile = path
+				return filepath.SkipAll
+			}
+		}
+		return nil
+	})
+
+	if matchFile == "" {
+		return mcp.NewToolResultError("salt not found in any transcript — make sure you wrote the salt in your conversation before calling whoami"), nil
+	}
+
+	// Extract session ID from filename (UUID.jsonl)
+	base := filepath.Base(matchFile)
+	sessionID := strings.TrimSuffix(base, ".jsonl")
+
+	return resultJSON(map[string]any{
+		"session_id":      sessionID,
+		"transcript_path": matchFile,
+	})
 }
 
 func (h *Handlers) HandleRegisterAgent(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	project := resolveProject(ctx, req)
+	project := resolveProject(req)
 	name := req.GetString("name", "")
 	if name == "" {
 		return mcp.NewToolResultError("name is required"), nil
@@ -29,9 +100,11 @@ func (h *Handlers) HandleRegisterAgent(ctx context.Context, req mcp.CallToolRequ
 	role := req.GetString("role", "")
 	description := req.GetString("description", "")
 	reportsTo := optionalString(req.GetString("reports_to", ""))
+	profileSlug := optionalString(req.GetString("profile_slug", ""))
+	isExecutive := req.GetBool("is_executive", false)
 	sessionID := optionalString(req.GetString("session_id", ""))
 
-	agent, err := h.db.RegisterAgent(project, name, role, description, reportsTo, sessionID)
+	agent, isRespawn, err := h.db.RegisterAgent(project, name, role, description, reportsTo, profileSlug, isExecutive, sessionID)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to register agent: %v", err)), nil
 	}
@@ -41,12 +114,19 @@ func (h *Handlers) HandleRegisterAgent(ctx context.Context, req mcp.CallToolRequ
 		h.registry.Register(project, name, sess.SessionID())
 	}
 
-	return resultJSON(agent)
+	// Build session_context for the response (Phase 2: boot-in-register)
+	sessionCtx := h.buildSessionContext(project, name, profileSlug)
+	sessionCtx["is_respawn"] = isRespawn
+
+	return resultJSON(map[string]any{
+		"agent":           agent,
+		"session_context": sessionCtx,
+	})
 }
 
 func (h *Handlers) HandleSendMessage(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	project := resolveProject(ctx, req)
-	from := resolveAgent(ctx, req)
+	project := resolveProject(req)
+	from := resolveAgent(req)
 	to := req.GetString("to", "")
 	msgType := req.GetString("type", "notification")
 	subject := req.GetString("subject", "")
@@ -58,6 +138,12 @@ func (h *Handlers) HandleSendMessage(ctx context.Context, req mcp.CallToolReques
 	metadata := req.GetString("metadata", "{}")
 	replyTo := optionalString(req.GetString("reply_to", ""))
 	conversationID := optionalString(req.GetString("conversation_id", ""))
+
+	// Support "to": "conversation:<id>" shorthand
+	if conversationID == nil && strings.HasPrefix(to, "conversation:") {
+		cid := strings.TrimPrefix(to, "conversation:")
+		conversationID = &cid
+	}
 
 	// Touch sender's last_seen
 	_ = h.db.TouchAgent(project, from)
@@ -74,6 +160,58 @@ func (h *Handlers) HandleSendMessage(ctx context.Context, req mcp.CallToolReques
 		to = "" // no single recipient for conversation messages
 	} else if to == "" {
 		return mcp.NewToolResultError("to is required (or provide conversation_id)"), nil
+	}
+
+	// Permission check: only enforce when teams are configured
+	if conversationID == nil && to != "*" && !strings.HasPrefix(to, "team:") {
+		hasTeams, _ := h.db.HasTeams(project)
+		if hasTeams {
+			allowed, err := h.db.CanMessage(project, from, to)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("permission check failed: %v", err)), nil
+			}
+			if !allowed {
+				return mcp.NewToolResultError(fmt.Sprintf("not authorized to message '%s' — no shared team, reports_to chain, or notify channel", to)), nil
+			}
+		}
+	}
+
+	// Team addressing: to="team:slug" → fan out to team members + team_inbox
+	if strings.HasPrefix(to, "team:") {
+		teamSlug := strings.TrimPrefix(to, "team:")
+		team, err := h.db.ResolveTeamSlug(project, teamSlug)
+		if err != nil || team == nil {
+			return mcp.NewToolResultError(fmt.Sprintf("team '%s' not found", teamSlug)), nil
+		}
+
+		msg, err := h.db.InsertMessage(project, from, to, msgType, subject, content, metadata, replyTo, conversationID)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to send message: %v", err)), nil
+		}
+
+		// Add to team inbox
+		_ = h.db.AddToTeamInbox(team.ID, msg.ID)
+
+		// Notify all team members
+		members, _ := h.db.GetTeamMemberNames(team.ID)
+		for _, member := range members {
+			if member != from {
+				h.registry.Notify(project, member, from, subject, msg.ID)
+			}
+		}
+
+		return resultJSON(msg)
+	}
+
+	// Broadcast permission: when teams exist, only admin team members can broadcast
+	if to == "*" {
+		hasTeams, _ := h.db.HasTeams(project)
+		if hasTeams {
+			allowed, _ := h.db.CanMessage(project, from, "*")
+			if !allowed {
+				return mcp.NewToolResultError("broadcast requires membership in an 'admin' type team"), nil
+			}
+		}
 	}
 
 	msg, err := h.db.InsertMessage(project, from, to, msgType, subject, content, metadata, replyTo, conversationID)
@@ -94,10 +232,11 @@ func (h *Handlers) HandleSendMessage(ctx context.Context, req mcp.CallToolReques
 }
 
 func (h *Handlers) HandleGetInbox(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	project := resolveProject(ctx, req)
-	agent := resolveAgent(ctx, req)
+	project := resolveProject(req)
+	agent := resolveAgent(req)
 	unreadOnly := req.GetBool("unread_only", true)
 	limit := req.GetInt("limit", 10)
+	fullContent := req.GetBool("full_content", false)
 
 	_ = h.db.TouchAgent(project, agent)
 
@@ -109,11 +248,10 @@ func (h *Handlers) HandleGetInbox(ctx context.Context, req mcp.CallToolRequest) 
 		messages = []models.Message{}
 	}
 
-	// Truncate content to keep response compact
-	truncated := make([]map[string]any, len(messages))
+	formatted := make([]map[string]any, len(messages))
 	for i, m := range messages {
 		content := m.Content
-		if len(content) > 300 {
+		if !fullContent && len(content) > 300 {
 			content = content[:300] + "..."
 		}
 		entry := map[string]any{
@@ -131,13 +269,13 @@ func (h *Handlers) HandleGetInbox(ctx context.Context, req mcp.CallToolRequest) 
 		if m.ConversationID != nil {
 			entry["conversation_id"] = *m.ConversationID
 		}
-		truncated[i] = entry
+		formatted[i] = entry
 	}
 
 	return resultJSON(map[string]any{
 		"agent":    agent,
 		"count":    len(messages),
-		"messages": truncated,
+		"messages": formatted,
 	})
 }
 
@@ -162,7 +300,7 @@ func (h *Handlers) HandleGetThread(ctx context.Context, req mcp.CallToolRequest)
 }
 
 func (h *Handlers) HandleListAgents(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	project := resolveProject(ctx, req)
+	project := resolveProject(req)
 
 	agents, err := h.db.ListAgents(project)
 	if err != nil {
@@ -172,14 +310,43 @@ func (h *Handlers) HandleListAgents(ctx context.Context, req mcp.CallToolRequest
 		agents = []models.Agent{}
 	}
 
+	// Enrich with live activity from ingester
+	var sessions []ingest.SessionState
+	if h.ingester != nil {
+		sessions = h.ingester.GetSessions()
+	}
+	sessionByID := make(map[string]ingest.SessionState)
+	for _, s := range sessions {
+		sessionByID[s.SessionID] = s
+	}
+
+	type agentWithActivity struct {
+		models.Agent
+		Activity     string `json:"activity,omitempty"`
+		ActivityTool string `json:"activity_tool,omitempty"`
+	}
+
+	result := make([]agentWithActivity, 0, len(agents))
+	for _, a := range agents {
+		aa := agentWithActivity{Agent: a}
+		if a.SessionID != nil {
+			if s, ok := sessionByID[*a.SessionID]; ok {
+				aa.Activity = string(s.Activity)
+				aa.ActivityTool = s.Tool
+			}
+		}
+		result = append(result, aa)
+	}
+
 	return resultJSON(map[string]any{
-		"count":  len(agents),
-		"agents": agents,
+		"count":  len(result),
+		"agents": result,
 	})
 }
 
 func (h *Handlers) HandleMarkRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	agent := resolveAgent(ctx, req)
+	project := resolveProject(req)
+	agent := resolveAgent(req)
 
 	// Support marking a whole conversation as read
 	convID := req.GetString("conversation_id", "")
@@ -198,7 +365,7 @@ func (h *Handlers) HandleMarkRead(ctx context.Context, req mcp.CallToolRequest) 
 		return mcp.NewToolResultError("message_ids or conversation_id is required"), nil
 	}
 
-	count, err := h.db.MarkRead(ids, agent)
+	count, err := h.db.MarkRead(ids, agent, project)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to mark read: %v", err)), nil
 	}
@@ -209,8 +376,8 @@ func (h *Handlers) HandleMarkRead(ctx context.Context, req mcp.CallToolRequest) 
 }
 
 func (h *Handlers) HandleCreateConversation(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	project := resolveProject(ctx, req)
-	agent := resolveAgent(ctx, req)
+	project := resolveProject(req)
+	agent := resolveAgent(req)
 	title := req.GetString("title", "")
 	if title == "" {
 		return mcp.NewToolResultError("title is required"), nil
@@ -245,8 +412,8 @@ func (h *Handlers) HandleCreateConversation(ctx context.Context, req mcp.CallToo
 }
 
 func (h *Handlers) HandleListConversations(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	project := resolveProject(ctx, req)
-	agent := resolveAgent(ctx, req)
+	project := resolveProject(req)
+	agent := resolveAgent(req)
 
 	convs, err := h.db.ListConversations(project, agent)
 	if err != nil {
@@ -264,7 +431,7 @@ func (h *Handlers) HandleListConversations(ctx context.Context, req mcp.CallTool
 }
 
 func (h *Handlers) HandleGetConversationMessages(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	agent := resolveAgent(ctx, req)
+	agent := resolveAgent(req)
 	convID := req.GetString("conversation_id", "")
 	if convID == "" {
 		return mcp.NewToolResultError("conversation_id is required"), nil
@@ -330,8 +497,8 @@ func (h *Handlers) HandleGetConversationMessages(ctx context.Context, req mcp.Ca
 }
 
 func (h *Handlers) HandleInviteToConversation(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	project := resolveProject(ctx, req)
-	agent := resolveAgent(ctx, req)
+	project := resolveProject(req)
+	agent := resolveAgent(req)
 	convID := req.GetString("conversation_id", "")
 	if convID == "" {
 		return mcp.NewToolResultError("conversation_id is required"), nil
@@ -375,22 +542,20 @@ func (h *Handlers) notifyConversation(project, conversationID, senderName, subje
 	}
 }
 
-// resolveProject returns the project from the `project` tool parameter if set,
-// otherwise falls back to the ?project= URL parameter from the connection.
-func resolveProject(ctx context.Context, req mcp.CallToolRequest) string {
+// resolveProject returns the project from the explicit `project` tool parameter.
+func resolveProject(req mcp.CallToolRequest) string {
 	if p := req.GetString("project", ""); p != "" {
 		return p
 	}
-	return ProjectFromContext(ctx)
+	return "default"
 }
 
-// resolveAgent returns the agent name from the `as` parameter if set,
-// otherwise falls back to the URL context (for backward compatibility).
-func resolveAgent(ctx context.Context, req mcp.CallToolRequest) string {
+// resolveAgent returns the agent name from the explicit `as` tool parameter.
+func resolveAgent(req mcp.CallToolRequest) string {
 	if as := req.GetString("as", ""); as != "" {
 		return as
 	}
-	return AgentFromContext(ctx)
+	return "anonymous"
 }
 
 // helpers
@@ -426,8 +591,8 @@ const sessionKey contextKey = "mcp_session"
 // --- Memory handlers ---
 
 func (h *Handlers) HandleSetMemory(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	project := resolveProject(ctx, req)
-	agent := resolveAgent(ctx, req)
+	project := resolveProject(req)
+	agent := resolveAgent(req)
 	key := req.GetString("key", "")
 	if key == "" {
 		return mcp.NewToolResultError("key is required"), nil
@@ -438,10 +603,11 @@ func (h *Handlers) HandleSetMemory(ctx context.Context, req mcp.CallToolRequest)
 	}
 	scope := req.GetString("scope", "project")
 	confidence := req.GetString("confidence", "stated")
+	layer := req.GetString("layer", "behavior")
 	tags := req.GetStringSlice("tags", nil)
 	tagsJSON := db.TagsToJSON(tags)
 
-	mem, err := h.db.SetMemory(project, agent, key, value, tagsJSON, scope, confidence)
+	mem, err := h.db.SetMemory(project, agent, key, value, tagsJSON, scope, confidence, layer)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to set memory: %v", err)), nil
 	}
@@ -458,8 +624,8 @@ func (h *Handlers) HandleSetMemory(ctx context.Context, req mcp.CallToolRequest)
 }
 
 func (h *Handlers) HandleGetMemory(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	project := resolveProject(ctx, req)
-	agent := resolveAgent(ctx, req)
+	project := resolveProject(req)
+	agent := resolveAgent(req)
 	key := req.GetString("key", "")
 	if key == "" {
 		return mcp.NewToolResultError("key is required"), nil
@@ -488,8 +654,8 @@ func (h *Handlers) HandleGetMemory(ctx context.Context, req mcp.CallToolRequest)
 }
 
 func (h *Handlers) HandleSearchMemory(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	project := resolveProject(ctx, req)
-	agent := resolveAgent(ctx, req)
+	project := resolveProject(req)
+	agent := resolveAgent(req)
 	query := req.GetString("query", "")
 	if query == "" {
 		return mcp.NewToolResultError("query is required"), nil
@@ -535,7 +701,7 @@ func (h *Handlers) HandleSearchMemory(ctx context.Context, req mcp.CallToolReque
 }
 
 func (h *Handlers) HandleListMemories(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	project := resolveProject(ctx, req)
+	project := resolveProject(req)
 	scope := req.GetString("scope", "")
 	agentFilter := req.GetString("agent", "")
 	tags := req.GetStringSlice("tags", nil)
@@ -578,8 +744,8 @@ func (h *Handlers) HandleListMemories(ctx context.Context, req mcp.CallToolReque
 }
 
 func (h *Handlers) HandleDeleteMemory(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	project := resolveProject(ctx, req)
-	agent := resolveAgent(ctx, req)
+	project := resolveProject(req)
+	agent := resolveAgent(req)
 	key := req.GetString("key", "")
 	if key == "" {
 		return mcp.NewToolResultError("key is required"), nil
@@ -598,8 +764,8 @@ func (h *Handlers) HandleDeleteMemory(ctx context.Context, req mcp.CallToolReque
 }
 
 func (h *Handlers) HandleResolveConflict(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	project := resolveProject(ctx, req)
-	agent := resolveAgent(ctx, req)
+	project := resolveProject(req)
+	agent := resolveAgent(req)
 	key := req.GetString("key", "")
 	if key == "" {
 		return mcp.NewToolResultError("key is required"), nil
@@ -618,5 +784,677 @@ func (h *Handlers) HandleResolveConflict(ctx context.Context, req mcp.CallToolRe
 	return resultJSON(map[string]any{
 		"resolved": true,
 		"memory":   winner,
+	})
+}
+
+// --- Profile handlers ---
+
+func (h *Handlers) HandleRegisterProfile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	slug := req.GetString("slug", "")
+	if slug == "" {
+		return mcp.NewToolResultError("slug is required"), nil
+	}
+	name := req.GetString("name", "")
+	if name == "" {
+		return mcp.NewToolResultError("name is required"), nil
+	}
+	role := req.GetString("role", "")
+	contextPack := req.GetString("context_pack", "")
+	soulKeys := req.GetString("soul_keys", "[]")
+	skills := req.GetString("skills", "[]")
+
+	profile, err := h.db.RegisterProfile(project, slug, name, role, contextPack, soulKeys, skills)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to register profile: %v", err)), nil
+	}
+	return resultJSON(profile)
+}
+
+func (h *Handlers) HandleGetProfile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	slug := req.GetString("slug", "")
+	if slug == "" {
+		return mcp.NewToolResultError("slug is required"), nil
+	}
+
+	profile, err := h.db.GetProfile(project, slug)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to get profile: %v", err)), nil
+	}
+	if profile == nil {
+		return mcp.NewToolResultError(fmt.Sprintf("profile not found: %s", slug)), nil
+	}
+	return resultJSON(profile)
+}
+
+func (h *Handlers) HandleListProfiles(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+
+	profiles, err := h.db.ListProfiles(project)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to list profiles: %v", err)), nil
+	}
+	if profiles == nil {
+		profiles = []models.Profile{}
+	}
+
+	return resultJSON(map[string]any{
+		"count":    len(profiles),
+		"profiles": profiles,
+	})
+}
+
+// --- Task handlers ---
+
+func (h *Handlers) HandleDispatchTask(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	agent := resolveAgent(req)
+	profile := req.GetString("profile", "")
+	if profile == "" {
+		return mcp.NewToolResultError("profile is required"), nil
+	}
+	title := req.GetString("title", "")
+	if title == "" {
+		return mcp.NewToolResultError("title is required"), nil
+	}
+	description := req.GetString("description", "")
+	priority := req.GetString("priority", "P2")
+	parentTaskID := optionalString(req.GetString("parent_task_id", ""))
+	boardID := optionalString(req.GetString("board_id", ""))
+
+	task, err := h.db.DispatchTask(project, profile, agent, title, description, priority, parentTaskID, boardID)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to dispatch task: %v", err)), nil
+	}
+
+	// Push notification for P0/P1 tasks
+	if priority == "P0" || priority == "P1" {
+		h.registry.NotifyProfile(project, profile, agent, fmt.Sprintf("[%s] %s", priority, title), task.ID)
+	}
+
+	return resultJSON(task)
+}
+
+func (h *Handlers) HandleClaimTask(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	agent := resolveAgent(req)
+	taskID := req.GetString("task_id", "")
+	if taskID == "" {
+		return mcp.NewToolResultError("task_id is required"), nil
+	}
+
+	task, err := h.db.ClaimTask(taskID, agent, project)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to claim task: %v", err)), nil
+	}
+	return resultJSON(task)
+}
+
+func (h *Handlers) HandleStartTask(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	agent := resolveAgent(req)
+	taskID := req.GetString("task_id", "")
+	if taskID == "" {
+		return mcp.NewToolResultError("task_id is required"), nil
+	}
+
+	task, err := h.db.StartTask(taskID, agent, project)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to start task: %v", err)), nil
+	}
+	return resultJSON(task)
+}
+
+func (h *Handlers) HandleCompleteTask(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	agent := resolveAgent(req)
+	taskID := req.GetString("task_id", "")
+	if taskID == "" {
+		return mcp.NewToolResultError("task_id is required"), nil
+	}
+	result := optionalString(req.GetString("result", ""))
+
+	task, err := h.db.CompleteTask(taskID, agent, project, result)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to complete task: %v", err)), nil
+	}
+
+	// Notify dispatcher
+	h.registry.Notify(project, task.DispatchedBy, agent, fmt.Sprintf("Task done: %s", task.Title), task.ID)
+
+	return resultJSON(task)
+}
+
+func (h *Handlers) HandleBlockTask(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	agent := resolveAgent(req)
+	taskID := req.GetString("task_id", "")
+	if taskID == "" {
+		return mcp.NewToolResultError("task_id is required"), nil
+	}
+	reason := optionalString(req.GetString("reason", ""))
+
+	task, err := h.db.BlockTask(taskID, agent, project, reason)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to block task: %v", err)), nil
+	}
+
+	// Notify dispatcher — blocked is critical
+	reasonStr := ""
+	if reason != nil {
+		reasonStr = ": " + *reason
+	}
+	h.registry.Notify(project, task.DispatchedBy, agent, fmt.Sprintf("BLOCKED: %s%s", task.Title, reasonStr), task.ID)
+
+	// Phase 4: Bubble notification up parent chain
+	if task.ParentTaskID != nil {
+		parentChain, _ := h.db.GetParentChain(taskID, project)
+		for _, parent := range parentChain {
+			h.registry.Notify(project, parent.DispatchedBy, agent,
+				fmt.Sprintf("Subtask blocked: '%s' → %s%s", task.Title, parent.Title, reasonStr), task.ID)
+		}
+	}
+
+	return resultJSON(task)
+}
+
+func (h *Handlers) HandleGetTask(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	taskID := req.GetString("task_id", "")
+	if taskID == "" {
+		return mcp.NewToolResultError("task_id is required"), nil
+	}
+	includeSubtasks := req.GetBool("include_subtasks", false)
+
+	var task *models.Task
+	var err error
+	if includeSubtasks {
+		task, err = h.db.GetTaskWithSubtasks(taskID, project)
+	} else {
+		task, err = h.db.GetTask(taskID, project)
+	}
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to get task: %v", err)), nil
+	}
+	if task == nil {
+		return mcp.NewToolResultError("task not found"), nil
+	}
+	return resultJSON(task)
+}
+
+func (h *Handlers) HandleListTasks(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	status := req.GetString("status", "")
+	profile := req.GetString("profile", "")
+	priority := req.GetString("priority", "")
+	assignedTo := req.GetString("as", "")
+	boardID := req.GetString("board_id", "")
+	limit := req.GetInt("limit", 50)
+
+	tasks, err := h.db.ListTasks(project, status, profile, priority, assignedTo, boardID, limit)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to list tasks: %v", err)), nil
+	}
+	if tasks == nil {
+		tasks = []models.Task{}
+	}
+
+	return resultJSON(map[string]any{
+		"count": len(tasks),
+		"tasks": tasks,
+	})
+}
+
+// --- Agent lifecycle ---
+
+func (h *Handlers) HandleDeactivateAgent(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	name := req.GetString("name", "")
+	if name == "" {
+		return mcp.NewToolResultError("name is required"), nil
+	}
+
+	if err := h.db.DeactivateAgent(project, name); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to deactivate agent: %v", err)), nil
+	}
+
+	return resultJSON(map[string]any{
+		"deactivated": true,
+		"agent":       name,
+	})
+}
+
+func (h *Handlers) HandleCreateBoard(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	agent := resolveAgent(req)
+	name := req.GetString("name", "")
+	slug := req.GetString("slug", "")
+	if name == "" || slug == "" {
+		return mcp.NewToolResultError("name and slug are required"), nil
+	}
+	description := req.GetString("description", "")
+
+	board, err := h.db.CreateBoard(project, name, slug, description, agent)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to create board: %v", err)), nil
+	}
+	return resultJSON(board)
+}
+
+func (h *Handlers) HandleListBoards(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	boards, err := h.db.ListBoards(project)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to list boards: %v", err)), nil
+	}
+	if boards == nil {
+		boards = []models.Board{}
+	}
+	return resultJSON(boards)
+}
+
+func (h *Handlers) HandleDeleteAgent(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	name := req.GetString("name", "")
+	if name == "" {
+		return mcp.NewToolResultError("name is required"), nil
+	}
+
+	if err := h.db.DeleteAgent(project, name); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to delete agent: %v", err)), nil
+	}
+
+	return resultJSON(map[string]any{
+		"deleted": true,
+		"agent":   name,
+	})
+}
+
+func (h *Handlers) HandleSleepAgent(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	agent := resolveAgent(req)
+
+	if err := h.db.SleepAgent(project, agent); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to sleep agent: %v", err)), nil
+	}
+
+	return resultJSON(map[string]any{
+		"status": "sleeping",
+		"agent":  agent,
+	})
+}
+
+// --- Find profiles by skill ---
+
+func (h *Handlers) HandleFindProfiles(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	tag := req.GetString("skill_tag", "")
+	if tag == "" {
+		return mcp.NewToolResultError("skill_tag is required"), nil
+	}
+
+	profiles, err := h.db.FindProfilesBySkillTag(project, tag)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to find profiles: %v", err)), nil
+	}
+	if profiles == nil {
+		profiles = []models.Profile{}
+	}
+
+	return resultJSON(map[string]any{
+		"skill_tag": tag,
+		"count":     len(profiles),
+		"profiles":  profiles,
+	})
+}
+
+// --- Session context ---
+
+func (h *Handlers) buildSessionContext(project, agentName string, profileSlug *string) map[string]any {
+	result := map[string]any{}
+
+	// Profile
+	if profileSlug != nil && *profileSlug != "" {
+		profile, err := h.db.GetProfile(project, *profileSlug)
+		if err == nil && profile != nil {
+			result["profile"] = profile
+		}
+	}
+
+	// Tasks
+	assignedToMe, dispatchedByMe, _ := h.db.GetAgentTasks(project, agentName)
+	if assignedToMe == nil {
+		assignedToMe = []models.Task{}
+	}
+	if dispatchedByMe == nil {
+		dispatchedByMe = []models.Task{}
+	}
+	result["pending_tasks"] = map[string]any{
+		"assigned_to_me":  assignedToMe,
+		"dispatched_by_me": dispatchedByMe,
+	}
+
+	// Unread messages (full content, not truncated)
+	unread, err := h.db.GetInbox(project, agentName, true, 50)
+	if err != nil || unread == nil {
+		unread = []models.Message{}
+	}
+	result["unread_messages"] = unread
+
+	// Active conversations
+	convs, err := h.db.ListConversations(project, agentName)
+	if err != nil || convs == nil {
+		convs = []models.ConversationSummary{}
+	}
+	result["active_conversations"] = convs
+
+	// Relevant memories (agent-scope + project-scope)
+	memories, err := h.db.ListMemories(project, "", agentName, nil, 20)
+	if err != nil || memories == nil {
+		memories = []models.Memory{}
+	}
+	result["relevant_memories"] = memories
+
+	return result
+}
+
+func (h *Handlers) HandleGetSessionContext(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	agent := resolveAgent(req)
+	profileSlugParam := optionalString(req.GetString("profile_slug", ""))
+
+	_ = h.db.TouchAgent(project, agent)
+
+	// Auto-detect profile from agent if not provided
+	if profileSlugParam == nil {
+		a, err := h.db.GetAgent(project, agent)
+		if err == nil && a != nil && a.ProfileSlug != nil {
+			profileSlugParam = a.ProfileSlug
+		}
+	}
+
+	sessionCtx := h.buildSessionContext(project, agent, profileSlugParam)
+	sessionCtx["agent"] = agent
+	sessionCtx["project"] = project
+
+	return resultJSON(sessionCtx)
+}
+
+// --- Soul RAG ---
+
+func (h *Handlers) HandleQueryContext(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	agent := resolveAgent(req)
+	query := req.GetString("query", "")
+	if query == "" {
+		return mcp.NewToolResultError("query is required"), nil
+	}
+	limit := req.GetInt("limit", 10)
+
+	// Source 1: memories via FTS5
+	memories, err := h.db.SearchMemory(project, agent, query, nil, "", limit)
+	if err != nil {
+		memories = []models.Memory{}
+	}
+
+	// Truncate memory values
+	memResults := make([]map[string]any, len(memories))
+	for i, m := range memories {
+		val := m.Value
+		if len(val) > 500 {
+			val = val[:500] + "..."
+		}
+		memResults[i] = map[string]any{
+			"type":       "memory",
+			"key":        m.Key,
+			"value":      val,
+			"scope":      m.Scope,
+			"agent_name": m.AgentName,
+			"confidence": m.Confidence,
+			"updated_at": m.UpdatedAt,
+		}
+	}
+
+	// Source 2: completed tasks (implicit knowledge)
+	doneTasks, err := h.db.ListTasks(project, "done", "", "", "", "", limit)
+	if err != nil {
+		doneTasks = []models.Task{}
+	}
+
+	// Filter tasks by relevance (simple keyword matching on title+description+result)
+	taskResults := make([]map[string]any, 0)
+	queryLower := strings.ToLower(query)
+	for _, t := range doneTasks {
+		searchable := strings.ToLower(t.Title + " " + t.Description)
+		if t.Result != nil {
+			searchable += " " + strings.ToLower(*t.Result)
+		}
+		// Simple relevance: check if any query word appears
+		words := strings.Fields(queryLower)
+		match := false
+		for _, w := range words {
+			if strings.Contains(searchable, w) {
+				match = true
+				break
+			}
+		}
+		if match {
+			entry := map[string]any{
+				"type":         "task_result",
+				"task_id":      t.ID,
+				"title":        t.Title,
+				"profile":      t.ProfileSlug,
+				"completed_at": t.CompletedAt,
+			}
+			if t.Result != nil {
+				r := *t.Result
+				if len(r) > 500 {
+					r = r[:500] + "..."
+				}
+				entry["result"] = r
+			}
+			taskResults = append(taskResults, entry)
+		}
+	}
+
+	// Combine and return
+	allResults := append(memResults, taskResults...)
+
+	return resultJSON(map[string]any{
+		"query":   query,
+		"count":   len(allResults),
+		"results": allResults,
+	})
+}
+
+// --- Teams + Orgs Handlers ---
+
+func (h *Handlers) HandleCreateOrg(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	name := req.GetString("name", "")
+	slug := req.GetString("slug", "")
+	description := req.GetString("description", "")
+
+	if name == "" || slug == "" {
+		return mcp.NewToolResultError("name and slug are required"), nil
+	}
+
+	org, err := h.db.CreateOrg(name, slug, description)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to create org: %v", err)), nil
+	}
+	return resultJSON(org)
+}
+
+func (h *Handlers) HandleListOrgs(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	orgs, err := h.db.ListOrgs()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to list orgs: %v", err)), nil
+	}
+	if orgs == nil {
+		orgs = []models.Org{}
+	}
+	return resultJSON(map[string]any{"count": len(orgs), "orgs": orgs})
+}
+
+func (h *Handlers) HandleCreateTeam(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	name := req.GetString("name", "")
+	slug := req.GetString("slug", "")
+	description := req.GetString("description", "")
+	teamType := req.GetString("type", "regular")
+	orgID := optionalString(req.GetString("org_id", ""))
+	parentTeamID := optionalString(req.GetString("parent_team_id", ""))
+
+	if name == "" || slug == "" {
+		return mcp.NewToolResultError("name and slug are required"), nil
+	}
+
+	// Validate type
+	switch teamType {
+	case "regular", "admin", "bot":
+	default:
+		return mcp.NewToolResultError("type must be 'regular', 'admin', or 'bot'"), nil
+	}
+
+	team, err := h.db.CreateTeam(name, slug, project, description, teamType, orgID, parentTeamID)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to create team: %v", err)), nil
+	}
+	return resultJSON(team)
+}
+
+func (h *Handlers) HandleListTeams(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+
+	teams, err := h.db.ListTeams(project)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to list teams: %v", err)), nil
+	}
+	if teams == nil {
+		teams = []models.Team{}
+	}
+
+	// Enrich with members
+	result := make([]map[string]any, 0, len(teams))
+	for _, t := range teams {
+		members, _ := h.db.GetTeamMembers(t.ID)
+		if members == nil {
+			members = []models.TeamMember{}
+		}
+		result = append(result, map[string]any{
+			"team":    t,
+			"members": members,
+		})
+	}
+
+	return resultJSON(map[string]any{"count": len(result), "teams": result})
+}
+
+func (h *Handlers) HandleAddTeamMember(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	teamSlug := req.GetString("team", "")
+	agentName := req.GetString("agent_name", "")
+	role := req.GetString("role", "member")
+
+	if teamSlug == "" || agentName == "" {
+		return mcp.NewToolResultError("team and agent_name are required"), nil
+	}
+
+	// Validate role
+	switch role {
+	case "admin", "lead", "member", "observer":
+	default:
+		return mcp.NewToolResultError("role must be 'admin', 'lead', 'member', or 'observer'"), nil
+	}
+
+	team, err := h.db.GetTeam(project, teamSlug)
+	if err != nil || team == nil {
+		return mcp.NewToolResultError(fmt.Sprintf("team '%s' not found", teamSlug)), nil
+	}
+
+	if err := h.db.AddTeamMember(team.ID, agentName, project, role); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to add member: %v", err)), nil
+	}
+
+	return resultJSON(map[string]any{
+		"team":       teamSlug,
+		"agent_name": agentName,
+		"role":       role,
+		"added":      true,
+	})
+}
+
+func (h *Handlers) HandleRemoveTeamMember(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	teamSlug := req.GetString("team", "")
+	agentName := req.GetString("agent_name", "")
+
+	if teamSlug == "" || agentName == "" {
+		return mcp.NewToolResultError("team and agent_name are required"), nil
+	}
+
+	team, err := h.db.GetTeam(project, teamSlug)
+	if err != nil || team == nil {
+		return mcp.NewToolResultError(fmt.Sprintf("team '%s' not found", teamSlug)), nil
+	}
+
+	if err := h.db.RemoveTeamMember(team.ID, agentName); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to remove member: %v", err)), nil
+	}
+
+	return resultJSON(map[string]any{
+		"team":       teamSlug,
+		"agent_name": agentName,
+		"removed":    true,
+	})
+}
+
+func (h *Handlers) HandleGetTeamInbox(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	teamSlug := req.GetString("team", "")
+	limit := req.GetInt("limit", 50)
+
+	if teamSlug == "" {
+		return mcp.NewToolResultError("team is required"), nil
+	}
+
+	team, err := h.db.GetTeam(project, teamSlug)
+	if err != nil || team == nil {
+		return mcp.NewToolResultError(fmt.Sprintf("team '%s' not found", teamSlug)), nil
+	}
+
+	msgs, err := h.db.GetTeamInbox(team.ID, limit)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to get team inbox: %v", err)), nil
+	}
+	if msgs == nil {
+		msgs = []models.Message{}
+	}
+
+	return resultJSON(map[string]any{
+		"team":     teamSlug,
+		"count":    len(msgs),
+		"messages": msgs,
+	})
+}
+
+func (h *Handlers) HandleAddNotifyChannel(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	agent := resolveAgent(req)
+	target := req.GetString("target", "")
+
+	if target == "" {
+		return mcp.NewToolResultError("target is required"), nil
+	}
+
+	if err := h.db.AddNotifyChannel(agent, project, target); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to add notify channel: %v", err)), nil
+	}
+
+	return resultJSON(map[string]any{
+		"agent":  agent,
+		"target": target,
+		"added":  true,
 	})
 }

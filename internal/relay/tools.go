@@ -10,15 +10,25 @@ var asParam = mcp.WithString("as", mcp.Description("Act as this agent (overrides
 // so agents can switch projects without changing the MCP connection.
 var projectParam = mcp.WithString("project", mcp.Description("Project namespace (overrides the default from the connection URL). Agents, messages, and conversations are isolated per project."))
 
+func whoamiTool() mcp.Tool {
+	return mcp.NewTool(
+		"whoami",
+		mcp.WithDescription("Identify your Claude Code session. Generate a unique salt (e.g. 3 random words), pass it here. The relay greps ~/.claude/ transcripts for that salt to find your session ID. Use the returned session_id when calling register_agent."),
+		mcp.WithString("salt", mcp.Description("A unique string you just generated (e.g. 'purple-falcon-nebula'). It must appear in your conversation transcript."), mcp.Required()),
+	)
+}
+
 func registerAgentTool() mcp.Tool {
 	return mcp.NewTool(
 		"register_agent",
-		mcp.WithDescription("Register an agent with the relay. Call this once per agent at startup to announce their presence."),
+		mcp.WithDescription("Register an agent with the relay. Call this once per agent at startup to announce their presence. Returns session_context with profile, tasks, unread messages, and conversations."),
 		projectParam,
 		mcp.WithString("name", mcp.Description("Unique agent name (e.g. 'backend', 'frontend')"), mcp.Required()),
 		mcp.WithString("role", mcp.Description("Agent role description (e.g. 'FastAPI backend developer')")),
 		mcp.WithString("description", mcp.Description("What this agent is currently working on")),
 		mcp.WithString("reports_to", mcp.Description("Name of the agent this one reports to (for org hierarchy)")),
+		mcp.WithBoolean("is_executive", mcp.Description("Mark this agent as an executive (shows crown on canvas)")),
+		mcp.WithString("profile_slug", mcp.Description("Profile archetype this agent runs (links to a registered profile)")),
 		mcp.WithString("session_id", mcp.Description("Claude Code session ID ($CLAUDE_SESSION_ID) — used for activity tracking via hooks")),
 	)
 }
@@ -49,7 +59,8 @@ func getInboxTool() mcp.Tool {
 		asParam,
 		projectParam,
 		mcp.WithBoolean("unread_only", mcp.Description("Only return unread messages (default: true)")),
-		mcp.WithNumber("limit", mcp.Description("Max number of messages to return (default: 10). Content is truncated to 300 chars — use get_thread for full messages.")),
+		mcp.WithNumber("limit", mcp.Description("Max number of messages to return (default: 10).")),
+		mcp.WithBoolean("full_content", mcp.Description("Return full message content instead of truncating to 300 chars (default: false)")),
 	)
 }
 
@@ -117,6 +128,7 @@ func getConversationMessagesTool() mcp.Tool {
 		mcp.WithString("conversation_id", mcp.Description("The conversation ID"), mcp.Required()),
 		mcp.WithNumber("limit", mcp.Description("Max number of messages to return (default: 50)")),
 		mcp.WithString("format", mcp.Description("Response format: 'full' (default), 'compact' (metadata only: id, from, type, subject, timestamp), 'digest' (metadata + first 200 chars of content)")),
+		mcp.WithBoolean("full_content", mcp.Description("When format is 'full', return complete message content without truncation (default: true)")),
 	)
 }
 
@@ -149,6 +161,10 @@ func setMemoryTool() mcp.Tool {
 		mcp.WithString("confidence",
 			mcp.Description("How this knowledge was obtained"),
 			mcp.Enum("stated", "inferred", "observed"),
+		),
+		mcp.WithString("layer",
+			mcp.Description("Memory layer: 'constraints' (hard rules, never override), 'behavior' (defaults, can adapt), 'context' (ephemeral, session-specific)"),
+			mcp.Enum("constraints", "behavior", "context"),
 		),
 	)
 }
@@ -225,5 +241,306 @@ func resolveConflictTool() mcp.Tool {
 			mcp.Description("Scope where the conflict exists"),
 			mcp.Enum("agent", "project", "global"),
 		),
+	)
+}
+
+// --- Profile tools ---
+
+func registerProfileTool() mcp.Tool {
+	return mcp.NewTool(
+		"register_profile",
+		mcp.WithDescription("Create or update a profile archetype. A profile defines a reusable agent role with a context pack (soul, skills, working style)."),
+		projectParam,
+		mcp.WithString("slug", mcp.Description("Unique profile identifier (e.g. 'backend', 'frontend', 'devops')"), mcp.Required()),
+		mcp.WithString("name", mcp.Description("Display name for the profile"), mcp.Required()),
+		mcp.WithString("role", mcp.Description("Role description")),
+		mcp.WithString("context_pack", mcp.Description("Markdown blob: soul, skills, working style")),
+		mcp.WithString("soul_keys", mcp.Description("JSON array of memory keys to load at boot")),
+		mcp.WithString("skills", mcp.Description("JSON array of skill objects, e.g. [{\"id\":\"supabase-admin\",\"name\":\"Supabase Administration\",\"tags\":[\"database\",\"auth\"]}]")),
+	)
+}
+
+func getProfileTool() mcp.Tool {
+	return mcp.NewTool(
+		"get_profile",
+		mcp.WithDescription("Retrieve a profile with its full context pack and skills."),
+		projectParam,
+		mcp.WithString("slug", mcp.Description("Profile slug to retrieve"), mcp.Required()),
+	)
+}
+
+func listProfilesTool() mcp.Tool {
+	return mcp.NewTool(
+		"list_profiles",
+		mcp.WithDescription("List all available profiles in a project."),
+		projectParam,
+	)
+}
+
+func findProfilesTool() mcp.Tool {
+	return mcp.NewTool(
+		"find_profiles",
+		mcp.WithDescription("Find profiles by skill tag. Returns profiles whose skills match the given tag."),
+		projectParam,
+		mcp.WithString("skill_tag", mcp.Description("Skill tag to search for (e.g. 'database', 'auth', 'frontend')"), mcp.Required()),
+	)
+}
+
+// --- Task tools ---
+
+func dispatchTaskTool() mcp.Tool {
+	return mcp.NewTool(
+		"dispatch_task",
+		mcp.WithDescription("Dispatch a task to a profile archetype. Creates a task in 'pending' state for agents running that profile to claim."),
+		asParam,
+		projectParam,
+		mcp.WithString("profile", mcp.Description("Profile slug to dispatch to"), mcp.Required()),
+		mcp.WithString("title", mcp.Description("Task title"), mcp.Required()),
+		mcp.WithString("description", mcp.Description("Detailed task description")),
+		mcp.WithString("priority",
+			mcp.Description("Task priority"),
+			mcp.Enum("P0", "P1", "P2", "P3"),
+		),
+		mcp.WithString("parent_task_id", mcp.Description("Parent task ID for subtasks")),
+		mcp.WithString("board_id", mcp.Description("Board ID to assign this task to (from create_board)")),
+	)
+}
+
+func claimTaskTool() mcp.Tool {
+	return mcp.NewTool(
+		"claim_task",
+		mcp.WithDescription("Claim a pending task. Transitions state to 'accepted'."),
+		asParam,
+		projectParam,
+		mcp.WithString("task_id", mcp.Description("Task ID to claim"), mcp.Required()),
+	)
+}
+
+func startTaskTool() mcp.Tool {
+	return mcp.NewTool(
+		"start_task",
+		mcp.WithDescription("Start working on a task. Transitions state to 'in-progress'. Can skip 'accepted' state."),
+		asParam,
+		projectParam,
+		mcp.WithString("task_id", mcp.Description("Task ID to start"), mcp.Required()),
+	)
+}
+
+func completeTaskTool() mcp.Tool {
+	return mcp.NewTool(
+		"complete_task",
+		mcp.WithDescription("Complete a task with a result. Transitions state to 'done'."),
+		asParam,
+		projectParam,
+		mcp.WithString("task_id", mcp.Description("Task ID to complete"), mcp.Required()),
+		mcp.WithString("result", mcp.Description("Task output/result")),
+	)
+}
+
+func blockTaskTool() mcp.Tool {
+	return mcp.NewTool(
+		"block_task",
+		mcp.WithDescription("Mark a task as blocked with a reason. Triggers push notification to dispatcher. If task has a parent, notifies parent's dispatcher too."),
+		asParam,
+		projectParam,
+		mcp.WithString("task_id", mcp.Description("Task ID to block"), mcp.Required()),
+		mcp.WithString("reason", mcp.Description("Why the task is blocked")),
+	)
+}
+
+func getTaskTool() mcp.Tool {
+	return mcp.NewTool(
+		"get_task",
+		mcp.WithDescription("Get full details of a task, optionally with its subtask chain."),
+		projectParam,
+		mcp.WithString("task_id", mcp.Description("Task ID"), mcp.Required()),
+		mcp.WithBoolean("include_subtasks", mcp.Description("Include subtask chain (max depth 3). Default: false")),
+	)
+}
+
+func listTasksTool() mcp.Tool {
+	return mcp.NewTool(
+		"list_tasks",
+		mcp.WithDescription("List tasks with filtering. Returns a task board view sorted by priority."),
+		asParam,
+		projectParam,
+		mcp.WithString("status",
+			mcp.Description("Filter by status"),
+			mcp.Enum("pending", "accepted", "in-progress", "done", "blocked"),
+		),
+		mcp.WithString("profile", mcp.Description("Filter by profile slug")),
+		mcp.WithString("priority",
+			mcp.Description("Filter by priority"),
+			mcp.Enum("P0", "P1", "P2", "P3"),
+		),
+		mcp.WithString("board_id", mcp.Description("Filter by board ID")),
+		mcp.WithNumber("limit", mcp.Description("Max results (default: 50)")),
+	)
+}
+
+// --- Boards ---
+
+func createBoardTool() mcp.Tool {
+	return mcp.NewTool(
+		"create_board",
+		mcp.WithDescription("Create a task board for a project. Agents can then dispatch tasks to this board. Returns the board with its ID."),
+		asParam,
+		projectParam,
+		mcp.WithString("name", mcp.Description("Board display name"), mcp.Required()),
+		mcp.WithString("slug", mcp.Description("Board slug (unique per project, e.g. 'sprint-1', 'bugs')"), mcp.Required()),
+		mcp.WithString("description", mcp.Description("Board description")),
+	)
+}
+
+func listBoardsTool() mcp.Tool {
+	return mcp.NewTool(
+		"list_boards",
+		mcp.WithDescription("List all task boards for a project."),
+		projectParam,
+	)
+}
+
+// --- Agent lifecycle ---
+
+func deactivateAgentTool() mcp.Tool {
+	return mcp.NewTool(
+		"deactivate_agent",
+		mcp.WithDescription("Permanently deactivate an agent. It disappears from list_agents and stops receiving messages. To come back: call register_agent again. For temporary pause, use sleep_agent instead."),
+		projectParam,
+		mcp.WithString("name", mcp.Description("Agent name to deactivate"), mcp.Required()),
+	)
+}
+
+func deleteAgentTool() mcp.Tool {
+	return mcp.NewTool(
+		"delete_agent",
+		mcp.WithDescription("Soft-delete an agent. It disappears from the UI entirely but stays in the database. To restore: call register_agent again."),
+		projectParam,
+		mcp.WithString("name", mcp.Description("Agent name to delete"), mcp.Required()),
+	)
+}
+
+func sleepAgentTool() mcp.Tool {
+	return mcp.NewTool(
+		"sleep_agent",
+		mcp.WithDescription("Put an agent to sleep. It stays visible in list_agents (status='sleeping') but signals it's not actively working. Messages are still queued. Wake up by calling register_agent again."),
+		asParam,
+		projectParam,
+	)
+}
+
+// --- Soul RAG ---
+
+func queryContextTool() mcp.Tool {
+	return mcp.NewTool(
+		"query_context",
+		mcp.WithDescription("Query relevant context for a task. Returns ranked memories and completed task results. Use this to load dynamic context at boot or before starting work."),
+		asParam,
+		projectParam,
+		mcp.WithString("query", mcp.Description("What context do you need? (e.g. 'supabase migration patterns')"), mcp.Required()),
+		mcp.WithNumber("limit", mcp.Description("Max results (default: 10)")),
+	)
+}
+
+// --- Session context ---
+
+func getSessionContextTool() mcp.Tool {
+	return mcp.NewTool(
+		"get_session_context",
+		mcp.WithDescription("Get everything an agent needs in one call: profile, pending tasks, unread messages, active conversations, and relevant memories. Use this at boot instead of making 5-8 separate calls."),
+		asParam,
+		projectParam,
+		mcp.WithString("profile_slug", mcp.Description("Profile slug to load context for (optional, auto-detected from agent registration)")),
+	)
+}
+
+// --- Teams + Orgs tools ---
+
+func createOrgTool() mcp.Tool {
+	return mcp.NewTool(
+		"create_org",
+		mcp.WithDescription("Create an organization. Orgs group teams across projects."),
+		asParam,
+		projectParam,
+		mcp.WithString("name", mcp.Description("Organization name"), mcp.Required()),
+		mcp.WithString("slug", mcp.Description("Unique slug (e.g. 'acme-corp')"), mcp.Required()),
+		mcp.WithString("description", mcp.Description("Organization description")),
+	)
+}
+
+func listOrgsTool() mcp.Tool {
+	return mcp.NewTool(
+		"list_orgs",
+		mcp.WithDescription("List all organizations."),
+		asParam,
+		projectParam,
+	)
+}
+
+func createTeamTool() mcp.Tool {
+	return mcp.NewTool(
+		"create_team",
+		mcp.WithDescription("Create a team within a project. Teams control messaging permissions and group agents. Types: 'regular' (default), 'admin' (unrestricted broadcast), 'bot'."),
+		asParam,
+		projectParam,
+		mcp.WithString("name", mcp.Description("Team name"), mcp.Required()),
+		mcp.WithString("slug", mcp.Description("Unique team slug within the project (e.g. 'frontend', 'comex')"), mcp.Required()),
+		mcp.WithString("description", mcp.Description("Team description")),
+		mcp.WithString("type", mcp.Description("Team type: 'regular' (default), 'admin' (unrestricted messaging), 'bot'")),
+		mcp.WithString("org_id", mcp.Description("Organization ID (optional)")),
+		mcp.WithString("parent_team_id", mcp.Description("Parent team ID for nested team hierarchy (optional)")),
+	)
+}
+
+func listTeamsTool() mcp.Tool {
+	return mcp.NewTool(
+		"list_teams",
+		mcp.WithDescription("List all teams in a project with their members."),
+		asParam,
+		projectParam,
+	)
+}
+
+func addTeamMemberTool() mcp.Tool {
+	return mcp.NewTool(
+		"add_team_member",
+		mcp.WithDescription("Add an agent to a team. Roles: 'admin', 'lead', 'member' (default), 'observer'."),
+		asParam,
+		projectParam,
+		mcp.WithString("team", mcp.Description("Team slug"), mcp.Required()),
+		mcp.WithString("agent_name", mcp.Description("Agent name to add"), mcp.Required()),
+		mcp.WithString("role", mcp.Description("Role in team: 'admin', 'lead', 'member' (default), 'observer'")),
+	)
+}
+
+func removeTeamMemberTool() mcp.Tool {
+	return mcp.NewTool(
+		"remove_team_member",
+		mcp.WithDescription("Remove an agent from a team (soft remove with left_at timestamp)."),
+		asParam,
+		projectParam,
+		mcp.WithString("team", mcp.Description("Team slug"), mcp.Required()),
+		mcp.WithString("agent_name", mcp.Description("Agent name to remove"), mcp.Required()),
+	)
+}
+
+func getTeamInboxTool() mcp.Tool {
+	return mcp.NewTool(
+		"get_team_inbox",
+		mcp.WithDescription("Get messages sent to a team (via to='team:slug' addressing)."),
+		asParam,
+		projectParam,
+		mcp.WithString("team", mcp.Description("Team slug"), mcp.Required()),
+		mcp.WithNumber("limit", mcp.Description("Max messages (default: 50)")),
+	)
+}
+
+func addNotifyChannelTool() mcp.Tool {
+	return mcp.NewTool(
+		"add_notify_channel",
+		mcp.WithDescription("Add a notify channel — allows this agent to message the target agent even outside team boundaries."),
+		asParam,
+		projectParam,
+		mcp.WithString("target", mcp.Description("Target agent name to allow messaging to"), mcp.Required()),
 	)
 }

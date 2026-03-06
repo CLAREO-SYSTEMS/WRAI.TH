@@ -72,9 +72,10 @@ func startServer() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Start stale agent cleanup goroutine.
+	// Start background goroutines.
 	cleanupDone := make(chan struct{})
 	relay.StartCleanup(database, cleanupDone)
+	relay.StartACKChecker(database, r.Registry, cleanupDone)
 
 	// Log ingested events (phase 1: log only, phase 2: TouchAgent + WS broadcast)
 	go func() {

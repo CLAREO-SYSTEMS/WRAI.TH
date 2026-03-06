@@ -56,6 +56,14 @@ func (i *Ingester) GetSessions() []SessionState {
 	return i.detector.GetSessions()
 }
 
+func (i *Ingester) SubscribeActivity() chan []SessionState {
+	return i.detector.Subscribe()
+}
+
+func (i *Ingester) UnsubscribeActivity(ch chan []SessionState) {
+	i.detector.Unsubscribe(ch)
+}
+
 func (i *Ingester) Stop() {
 	i.cancel()
 	close(i.Events)

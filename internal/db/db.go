@@ -84,14 +84,19 @@ func NewReadOnly() (*DB, error) {
 func migrate(conn *sql.DB) error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS agents (
-		id            TEXT PRIMARY KEY,
-		name          TEXT NOT NULL,
-		role          TEXT NOT NULL DEFAULT '',
-		description   TEXT NOT NULL DEFAULT '',
-		registered_at TEXT NOT NULL,
-		last_seen     TEXT NOT NULL,
-		project       TEXT NOT NULL DEFAULT 'default',
-		reports_to    TEXT
+		id              TEXT PRIMARY KEY,
+		name            TEXT NOT NULL,
+		role            TEXT NOT NULL DEFAULT '',
+		description     TEXT NOT NULL DEFAULT '',
+		registered_at   TEXT NOT NULL,
+		last_seen       TEXT NOT NULL,
+		project         TEXT NOT NULL DEFAULT 'default',
+		reports_to      TEXT,
+		profile_slug    TEXT,
+		status          TEXT NOT NULL DEFAULT 'active',
+		deactivated_at  TEXT,
+		is_executive    INTEGER NOT NULL DEFAULT 0,
+		session_id      TEXT
 	);
 
 	CREATE TABLE IF NOT EXISTS messages (
@@ -165,7 +170,11 @@ func migrate(conn *sql.DB) error {
 	// Hierarchy migration (idempotent — ALTER fails if column exists).
 	conn.Exec(`ALTER TABLE agents ADD COLUMN reports_to TEXT`)
 
-	// Session ID for activity tracking (idempotent).
+	// Agent extensions (idempotent).
+	conn.Exec(`ALTER TABLE agents ADD COLUMN profile_slug TEXT`)
+	conn.Exec(`ALTER TABLE agents ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`)
+	conn.Exec(`ALTER TABLE agents ADD COLUMN deactivated_at TEXT`)
+	conn.Exec(`ALTER TABLE agents ADD COLUMN is_executive INTEGER NOT NULL DEFAULT 0`)
 	conn.Exec(`ALTER TABLE agents ADD COLUMN session_id TEXT`)
 	conn.Exec(`ALTER TABLE messages ADD COLUMN project TEXT NOT NULL DEFAULT 'default'`)
 	conn.Exec(`ALTER TABLE conversations ADD COLUMN project TEXT NOT NULL DEFAULT 'default'`)
@@ -183,6 +192,145 @@ func migrate(conn *sql.DB) error {
 	if err := migrateMemories(conn); err != nil {
 		return fmt.Errorf("migrate memories: %w", err)
 	}
+
+	// Phase 1: Per-agent read receipts
+	conn.Exec(`CREATE TABLE IF NOT EXISTS message_reads (
+		message_id TEXT NOT NULL,
+		agent_name TEXT NOT NULL,
+		project    TEXT NOT NULL DEFAULT 'default',
+		read_at    TEXT NOT NULL,
+		UNIQUE(message_id, agent_name)
+	)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_message_reads_agent ON message_reads(agent_name, project)`)
+
+	// Phase 2: Profiles
+	conn.Exec(`CREATE TABLE IF NOT EXISTS profiles (
+		id           TEXT PRIMARY KEY,
+		slug         TEXT NOT NULL,
+		name         TEXT NOT NULL,
+		role         TEXT NOT NULL DEFAULT '',
+		context_pack TEXT NOT NULL DEFAULT '',
+		soul_keys    TEXT NOT NULL DEFAULT '[]',
+		project      TEXT NOT NULL DEFAULT 'default',
+		org_id       TEXT,
+		created_at   TEXT NOT NULL,
+		updated_at   TEXT NOT NULL
+	)`)
+	conn.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_project_slug ON profiles(project, slug)`)
+
+	// Agent table migrations for profiles
+	conn.Exec(`ALTER TABLE agents ADD COLUMN profile_slug TEXT`)
+	conn.Exec(`ALTER TABLE agents ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`)
+	conn.Exec(`ALTER TABLE agents ADD COLUMN deactivated_at TEXT`)
+
+	// Phase 3: Tasks
+	conn.Exec(`CREATE TABLE IF NOT EXISTS tasks (
+		id              TEXT PRIMARY KEY,
+		profile_slug    TEXT NOT NULL,
+		assigned_to     TEXT,
+		dispatched_by   TEXT NOT NULL,
+		title           TEXT NOT NULL,
+		description     TEXT NOT NULL DEFAULT '',
+		priority        TEXT NOT NULL DEFAULT 'P2',
+		status          TEXT NOT NULL DEFAULT 'pending',
+		result          TEXT,
+		blocked_reason  TEXT,
+		project         TEXT NOT NULL DEFAULT 'default',
+		dispatched_at   TEXT NOT NULL,
+		accepted_at     TEXT,
+		started_at      TEXT,
+		completed_at    TEXT,
+		reply_to_task   TEXT
+	)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project, status)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_tasks_profile ON tasks(project, profile_slug)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(project, priority, status)`)
+
+	// Message task_id FK
+	conn.Exec(`ALTER TABLE messages ADD COLUMN task_id TEXT`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_messages_task ON messages(task_id)`)
+
+	// Agent is_executive flag
+	conn.Exec(`ALTER TABLE agents ADD COLUMN is_executive BOOLEAN NOT NULL DEFAULT FALSE`)
+
+	// Phase 3: ACK timeout columns
+	conn.Exec(`ALTER TABLE tasks ADD COLUMN ack_notified_at TEXT`)
+	conn.Exec(`ALTER TABLE tasks ADD COLUMN ack_escalated_at TEXT`)
+
+	// Phase 4: parent_task_id (rename from reply_to_task)
+	conn.Exec(`ALTER TABLE tasks ADD COLUMN parent_task_id TEXT`)
+	// Migrate existing data from reply_to_task → parent_task_id
+	conn.Exec(`UPDATE tasks SET parent_task_id = reply_to_task WHERE reply_to_task IS NOT NULL AND parent_task_id IS NULL`)
+
+	// Phase 5: Skills on profiles
+	conn.Exec(`ALTER TABLE profiles ADD COLUMN skills TEXT NOT NULL DEFAULT '[]'`)
+
+	// Phase 6: Teams + Orgs
+	conn.Exec(`CREATE TABLE IF NOT EXISTS orgs (
+		id          TEXT PRIMARY KEY,
+		name        TEXT NOT NULL,
+		slug        TEXT UNIQUE NOT NULL,
+		description TEXT NOT NULL DEFAULT '',
+		created_at  TEXT NOT NULL
+	)`)
+
+	conn.Exec(`CREATE TABLE IF NOT EXISTS teams (
+		id             TEXT PRIMARY KEY,
+		name           TEXT NOT NULL,
+		slug           TEXT NOT NULL,
+		org_id         TEXT,
+		project        TEXT NOT NULL DEFAULT 'default',
+		description    TEXT NOT NULL DEFAULT '',
+		type           TEXT NOT NULL DEFAULT 'regular',
+		parent_team_id TEXT,
+		created_at     TEXT NOT NULL
+	)`)
+	conn.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_teams_project_slug ON teams(project, slug)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_teams_org ON teams(org_id)`)
+
+	conn.Exec(`CREATE TABLE IF NOT EXISTS team_members (
+		team_id    TEXT NOT NULL,
+		agent_name TEXT NOT NULL,
+		project    TEXT NOT NULL DEFAULT 'default',
+		role       TEXT NOT NULL DEFAULT 'member',
+		joined_at  TEXT NOT NULL,
+		left_at    TEXT,
+		PRIMARY KEY (team_id, agent_name)
+	)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_team_members_agent ON team_members(agent_name, project)`)
+
+	conn.Exec(`CREATE TABLE IF NOT EXISTS team_inbox (
+		team_id    TEXT NOT NULL,
+		message_id TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		PRIMARY KEY (team_id, message_id)
+	)`)
+
+	conn.Exec(`CREATE TABLE IF NOT EXISTS agent_notify_channels (
+		agent_name TEXT NOT NULL,
+		project    TEXT NOT NULL DEFAULT 'default',
+		target     TEXT NOT NULL,
+		PRIMARY KEY (agent_name, project, target)
+	)`)
+
+	// Agent org_id for multi-org
+	conn.Exec(`ALTER TABLE agents ADD COLUMN org_id TEXT`)
+
+	// Boards per project
+	conn.Exec(`CREATE TABLE IF NOT EXISTS boards (
+		id          TEXT PRIMARY KEY,
+		project     TEXT NOT NULL DEFAULT 'default',
+		name        TEXT NOT NULL,
+		slug        TEXT NOT NULL,
+		description TEXT NOT NULL DEFAULT '',
+		created_by  TEXT NOT NULL DEFAULT 'user',
+		created_at  TEXT NOT NULL
+	)`)
+	conn.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_boards_project_slug ON boards(project, slug)`)
+
+	// Task board_id FK
+	conn.Exec(`ALTER TABLE tasks ADD COLUMN board_id TEXT`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_tasks_board ON tasks(board_id)`)
 
 	return nil
 }
@@ -206,16 +354,21 @@ func migrateDropGlobalUnique(conn *sql.DB) {
 
 	stmts := []string{
 		`CREATE TABLE agents_new (
-			id            TEXT PRIMARY KEY,
-			name          TEXT NOT NULL,
-			role          TEXT NOT NULL DEFAULT '',
-			description   TEXT NOT NULL DEFAULT '',
-			registered_at TEXT NOT NULL,
-			last_seen     TEXT NOT NULL,
-			project       TEXT NOT NULL DEFAULT 'default',
-			reports_to    TEXT
+			id              TEXT PRIMARY KEY,
+			name            TEXT NOT NULL,
+			role            TEXT NOT NULL DEFAULT '',
+			description     TEXT NOT NULL DEFAULT '',
+			registered_at   TEXT NOT NULL,
+			last_seen       TEXT NOT NULL,
+			project         TEXT NOT NULL DEFAULT 'default',
+			reports_to      TEXT,
+			profile_slug    TEXT,
+			status          TEXT NOT NULL DEFAULT 'active',
+			deactivated_at  TEXT,
+			is_executive    INTEGER NOT NULL DEFAULT 0,
+			session_id      TEXT
 		)`,
-		`INSERT INTO agents_new SELECT id, name, role, description, registered_at, last_seen, project, reports_to FROM agents`,
+		`INSERT INTO agents_new SELECT id, name, role, description, registered_at, last_seen, project, reports_to, NULL, 'active', NULL, 0, NULL FROM agents`,
 		`DROP TABLE agents`,
 		`ALTER TABLE agents_new RENAME TO agents`,
 		`CREATE INDEX IF NOT EXISTS idx_agents_project ON agents(project)`,
@@ -250,10 +403,14 @@ func migrateMemories(conn *sql.DB) error {
 		created_at    TEXT NOT NULL,
 		updated_at    TEXT NOT NULL,
 		archived_at   TEXT,
-		archived_by   TEXT
+		archived_by   TEXT,
+		layer         TEXT NOT NULL DEFAULT 'behavior'
 	)`); err != nil {
 		return fmt.Errorf("create memories table: %w", err)
 	}
+
+	// Layer column migration for existing DBs (idempotent).
+	conn.Exec(`ALTER TABLE memories ADD COLUMN layer TEXT NOT NULL DEFAULT 'behavior'`)
 
 	// Indexes (all idempotent)
 	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_memories_key_scope ON memories(project, scope, key) WHERE archived_at IS NULL`)

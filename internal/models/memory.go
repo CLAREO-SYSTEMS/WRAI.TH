@@ -17,4 +17,5 @@ type Memory struct {
 	UpdatedAt    string  `json:"updated_at"`
 	ArchivedAt   *string `json:"archived_at,omitempty"`
 	ArchivedBy   *string `json:"archived_by,omitempty"`
+	Layer        string  `json:"layer"`                    // "constraints", "behavior", "context"
 }

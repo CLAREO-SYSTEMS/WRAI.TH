@@ -41,41 +41,35 @@ func (d *DB) GetInbox(project, agentName string, unreadOnly bool, limit int) ([]
 	}
 
 	query := `
-		SELECT id, from_agent, to_agent, reply_to, type, subject, content, metadata, created_at, read_at, conversation_id, project
-		FROM messages
-		WHERE project = ?
+		SELECT m.id, m.from_agent, m.to_agent, m.reply_to, m.type, m.subject, m.content, m.metadata, m.created_at, m.read_at, m.conversation_id, m.project, m.task_id
+		FROM messages m
+		WHERE m.project = ?
 			AND (
 				-- Legacy 1-1 and broadcast
-				(conversation_id IS NULL AND (to_agent = ? OR (to_agent = '*' AND from_agent != ?)))
+				(m.conversation_id IS NULL AND (m.to_agent = ? OR (m.to_agent = '*' AND m.from_agent != ?)))
 				-- Conversations where I'm a member
-				OR (conversation_id IS NOT NULL AND conversation_id IN (
+				OR (m.conversation_id IS NOT NULL AND m.conversation_id IN (
 					SELECT conversation_id FROM conversation_members
 					WHERE agent_name = ? AND left_at IS NULL
-				) AND from_agent != ?)
+				) AND m.from_agent != ?)
 			)
 	`
 	args := []any{project, agentName, agentName, agentName, agentName}
 
 	if unreadOnly {
-		query += ` AND (
-			(conversation_id IS NULL AND read_at IS NULL)
-			OR (conversation_id IS NOT NULL AND created_at > COALESCE(
-				(SELECT last_read_at FROM conversation_reads
-				 WHERE conversation_id = messages.conversation_id AND agent_name = ?),
-				'1970-01-01T00:00:00Z'
-			))
+		query += ` AND NOT EXISTS (
+			SELECT 1 FROM message_reads mr WHERE mr.message_id = m.id AND mr.agent_name = ?
 		)`
 		args = append(args, agentName)
 	}
 
-	query += " ORDER BY created_at DESC LIMIT ?"
+	query += " ORDER BY m.created_at DESC LIMIT ?"
 	args = append(args, limit)
 
 	return d.queryMessages(query, args...)
 }
 
 func (d *DB) GetThread(messageID string) ([]models.Message, error) {
-	// Find the root message ID
 	rootID := messageID
 	for {
 		var replyTo *string
@@ -89,13 +83,12 @@ func (d *DB) GetThread(messageID string) ([]models.Message, error) {
 		rootID = *replyTo
 	}
 
-	// Get root + all descendants
 	query := `
 		WITH RECURSIVE thread AS (
-			SELECT id, from_agent, to_agent, reply_to, type, subject, content, metadata, created_at, read_at, conversation_id, project
+			SELECT id, from_agent, to_agent, reply_to, type, subject, content, metadata, created_at, read_at, conversation_id, project, task_id
 			FROM messages WHERE id = ?
 			UNION ALL
-			SELECT m.id, m.from_agent, m.to_agent, m.reply_to, m.type, m.subject, m.content, m.metadata, m.created_at, m.read_at, m.conversation_id, m.project
+			SELECT m.id, m.from_agent, m.to_agent, m.reply_to, m.type, m.subject, m.content, m.metadata, m.created_at, m.read_at, m.conversation_id, m.project, m.task_id
 			FROM messages m
 			JOIN thread t ON m.reply_to = t.id
 		)
@@ -105,40 +98,27 @@ func (d *DB) GetThread(messageID string) ([]models.Message, error) {
 	return d.queryMessages(query, rootID)
 }
 
-func (d *DB) MarkRead(messageIDs []string, agentName string) (int, error) {
+func (d *DB) MarkRead(messageIDs []string, agentName, project string) (int, error) {
 	if len(messageIDs) == 0 {
 		return 0, nil
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
+	count := 0
 
-	// Build placeholders
-	placeholders := ""
-	args := []any{now}
-	for i, id := range messageIDs {
-		if i > 0 {
-			placeholders += ","
+	for _, id := range messageIDs {
+		result, err := d.conn.Exec(
+			"INSERT OR IGNORE INTO message_reads (message_id, agent_name, project, read_at) VALUES (?, ?, ?, ?)",
+			id, agentName, project, now,
+		)
+		if err != nil {
+			return count, fmt.Errorf("mark read: %w", err)
 		}
-		placeholders += "?"
-		args = append(args, id)
-	}
-	args = append(args, agentName, agentName)
-
-	query := fmt.Sprintf(
-		"UPDATE messages SET read_at = ? WHERE id IN (%s) AND (to_agent = ? OR (to_agent = '*' AND from_agent != ?)) AND read_at IS NULL",
-		placeholders,
-	)
-
-	result, err := d.conn.Exec(query, args...)
-	if err != nil {
-		return 0, fmt.Errorf("mark read: %w", err)
+		n, _ := result.RowsAffected()
+		count += int(n)
 	}
 
-	n, _ := result.RowsAffected()
-
-	// Also update conversation_reads for any conversation messages just marked.
-	// Collect all conversation IDs first, then close rows before writing
-	// (SQLite deadlocks if you write while a read cursor is open).
+	// Also update conversation_reads for any conversation messages
 	convPlaceholders := ""
 	convArgs := make([]any, 0, len(messageIDs))
 	for i, id := range messageIDs {
@@ -166,12 +146,12 @@ func (d *DB) MarkRead(messageIDs []string, agentName string) (int, error) {
 		}
 	}
 
-	return int(n), nil
+	return count, nil
 }
 
 func (d *DB) GetMessage(id string) (*models.Message, error) {
 	msgs, err := d.queryMessages(
-		"SELECT id, from_agent, to_agent, reply_to, type, subject, content, metadata, created_at, read_at, conversation_id, project FROM messages WHERE id = ?",
+		"SELECT id, from_agent, to_agent, reply_to, type, subject, content, metadata, created_at, read_at, conversation_id, project, task_id FROM messages WHERE id = ?",
 		id,
 	)
 	if err != nil {
@@ -218,7 +198,7 @@ func (d *DB) queryMessages(query string, args ...any) ([]models.Message, error) 
 	var messages []models.Message
 	for rows.Next() {
 		var m models.Message
-		if err := rows.Scan(&m.ID, &m.From, &m.To, &m.ReplyTo, &m.Type, &m.Subject, &m.Content, &m.Metadata, &m.CreatedAt, &m.ReadAt, &m.ConversationID, &m.Project); err != nil {
+		if err := rows.Scan(&m.ID, &m.From, &m.To, &m.ReplyTo, &m.Type, &m.Subject, &m.Content, &m.Metadata, &m.CreatedAt, &m.ReadAt, &m.ConversationID, &m.Project, &m.TaskID); err != nil {
 			return nil, fmt.Errorf("scan message: %w", err)
 		}
 		messages = append(messages, m)
