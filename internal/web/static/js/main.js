@@ -1,11 +1,15 @@
 import { CanvasEngine } from "./canvas.js";
-import { WorldBackground, World } from "./world.js";
+import { SpaceBackground, World } from "./world.js";
 import { AgentView } from "./agent-view.js";
 import { APIClient } from "./api-client.js";
 import { MessageOrb } from "./message-orb.js";
 import { KanbanBoard } from "./kanban.js";
+import { VaultBrowser } from "./vault.js";
 import { ShortcutManager } from "./shortcuts.js";
 import { ConnectionOverlay } from "./connections.js";
+import { spaceAssets } from "./space-assets.js";
+import { roboSprite } from "./robo-sprite.js";
+import { mechSprite } from "./mech-sprite.js";
 
 // --- Composite key for cross-project agent identity ---
 function agentKey(project, name) {
@@ -31,9 +35,14 @@ const detailReportsTo = document.getElementById("detail-reports-to");
 const detailDirectReports = document.getElementById("detail-direct-reports");
 const userQuestionsPanel = document.getElementById("user-questions");
 
+// Preload space assets
+spaceAssets.preload();
+roboSprite.preload();
+mechSprite.preload();
+
 // State
 const engine = new CanvasEngine(canvas);
-const worldBg = new WorldBackground();
+const worldBg = new SpaceBackground();
 const world = new World();
 const agentViews = new Map();      // "project:name" -> AgentView
 let projectGroups = new Map();      // project -> Set<agentKey>
@@ -47,6 +56,7 @@ let teamsData = [];                 // cached teams with members
 let connected = false;
 let firstLayout = true;
 let hoveredAgentKey = null;
+let activitySessions = {};
 
 const connectionOverlay = new ConnectionOverlay();
 
@@ -57,10 +67,17 @@ engine.start();
 
 // --- Cluster layout ---
 
+let _teleportAgents = false; // skip lerp, snap to position
+
 function layoutAgents() {
   const projects = [...projectGroups.keys()].sort();
   const count = agentViews.size;
-  if (count === 0) {
+  if (count === 0 && viewMode !== "galaxy") {
+    world.clusters = [];
+    return;
+  }
+  // In galaxy view, we may have projects even with no local agents
+  if (viewMode === "galaxy" && count === 0 && projectsData.length === 0) {
     world.clusters = [];
     return;
   }
@@ -69,151 +86,251 @@ function layoutAgents() {
   const cx = engine.width / 2;
   const cy = engine.height / 2;
 
-  if (projects.length <= 1) {
-    // --- Single project: team-aware layout ---
-    const project = projects[0] || "default";
-    const keys = projectGroups.get(project) || new Set();
-    const agentCount = keys.size;
+  // Clear state (preserve projectPlanets for angle persistence)
+  const _prevPlanets = world.projectPlanets;
+  world.sunCenter = null;
+  world.projectPlanets = [];
+  world.colony = null;
 
-    // Build team clusters from agentsData
-    const teamClusters = new Map(); // teamSlug -> Set<agentKey>
-    const agentPrimaryTeam = new Map(); // agentKey -> teamSlug
-    const placed = new Set();
+  for (const [, av] of agentViews) {
+    av.minimal = viewMode === "galaxy";
+    if (viewMode !== "galaxy") av.orbit = null;
+  }
 
-    for (const a of agentsData) {
-      const ap = a.project || "default";
-      if (ap !== project) continue;
-      const key = agentKey(ap, a.name);
-      if (!a.teams || a.teams.length === 0) continue;
-      // Primary team = first team (prefer non-admin for layout grouping)
-      const primary = a.teams.find(t => t.type !== "admin") || a.teams[0];
-      agentPrimaryTeam.set(key, primary.slug);
-      for (const t of a.teams) {
-        if (!teamClusters.has(t.slug)) teamClusters.set(t.slug, new Set());
-        teamClusters.get(t.slug).add(key);
-      }
-    }
+  if (viewMode === "colony" && colonyProject && projectGroups.has(colonyProject)) {
+    // --- Colony view: focused project, agents on planet surface ---
+    const project = colonyProject;
+    const keys = [...(projectGroups.get(project) || new Set())];
+    const agentCount = keys.length;
 
-    // Agents with no team go to "ungrouped"
+    // Find planet type from projectsData (DB) -> derive solarPlanet for biome
+    const projInfo = projectsData.find(p => p.name === project);
+    const planetType = projInfo ? projInfo.planet_type : "terran/1";
+    const biomeCategory = planetType.split("/")[0]; // e.g. "terran", "lava"
+    // Map biome category to a solar planet for surface rendering
+    const BIOME_TO_SOLAR = {
+      barren: "mercury", desert: "mars", forest: "earth", gas_giant: "jupiter",
+      ice: "uranus", lava: "venus", ocean: "neptune", terran: "earth", tundra: "uranus",
+    };
+    const solarPlanet = BIOME_TO_SOLAR[biomeCategory] || "earth";
+
+    // Build hierarchy tree for colony layout
+    const children = new Map();
+    const roots = [];
     for (const key of keys) {
-      if (!agentPrimaryTeam.has(key)) {
-        agentPrimaryTeam.set(key, "__ungrouped");
-        if (!teamClusters.has("__ungrouped")) teamClusters.set("__ungrouped", new Set());
-        teamClusters.get("__ungrouped").add(key);
-      }
-    }
-
-    // Group agents by their PRIMARY team for layout
-    const primaryGroups = new Map(); // teamSlug -> [agentKey]
-    for (const key of keys) {
-      const team = agentPrimaryTeam.get(key) || "__ungrouped";
-      if (!primaryGroups.has(team)) primaryGroups.set(team, []);
-      primaryGroups.get(team).push(key);
-    }
-
-    const groupList = [...primaryGroups.entries()].filter(([, members]) => members.length > 0);
-    const numGroups = groupList.length;
-
-    if (numGroups <= 1 && agentCount <= 3) {
-      // Very few agents — simple centered layout
-      let i = 0;
-      const radius = agentCount > 1 ? Math.min(engine.width, engine.height) * 0.20 : 0;
-      for (const key of keys) {
-        const av = agentViews.get(key);
-        if (!av) continue;
-        if (agentCount === 1) {
-          av.targetX = cx;
-          av.targetY = cy;
+      const av = agentViews.get(key);
+      if (!av) continue;
+      if (av._reportsTo) {
+        const parentKey = agentKey(av.project, av._reportsTo);
+        if (keys.includes(parentKey)) {
+          if (!children.has(parentKey)) children.set(parentKey, []);
+          children.get(parentKey).push(key);
         } else {
-          const angle = -Math.PI / 2 + (i / agentCount) * Math.PI * 2;
-          av.targetX = cx + Math.cos(angle) * radius;
-          av.targetY = cy + Math.sin(angle) * radius;
+          roots.push(key);
         }
-        i++;
+      } else {
+        roots.push(key);
+      }
+    }
+
+    function setColonyMode(av) {
+      av.orbit = null;
+      av.solarPlanet = null;
+      av.minimal = false;
+      av.colony = true; // mech sprites in colony view
+    }
+
+    // If no hierarchy, simple horizontal layout centered
+    if (roots.length === agentCount || agentCount <= 2) {
+      const AGENT_SPACING = Math.min(120, engine.width / (agentCount + 1));
+      const startX = cx - (agentCount - 1) * AGENT_SPACING / 2;
+      for (let i = 0; i < keys.length; i++) {
+        const av = agentViews.get(keys[i]);
+        if (!av) continue;
+        setColonyMode(av);
+        av.targetX = agentCount === 1 ? cx : startX + i * AGENT_SPACING;
+        av.targetY = cy;
       }
     } else {
-      // Team-based cluster layout
-      // Place team groups on a circle, agents in each group in a small sub-circle
-      const outerR = Math.min(engine.width, engine.height) * 0.28;
-      const maxSubR = outerR * 0.35;
-
-      for (let gi = 0; gi < groupList.length; gi++) {
-        const [, members] = groupList[gi];
-        const groupAngle = -Math.PI / 2 + (gi / numGroups) * Math.PI * 2;
-        const gcx = cx + Math.cos(groupAngle) * outerR;
-        const gcy = cy + Math.sin(groupAngle) * outerR;
-
-        if (members.length === 1) {
-          const av = agentViews.get(members[0]);
-          if (av) { av.targetX = gcx; av.targetY = gcy; }
-        } else {
-          const subR = Math.min(maxSubR, 50 + members.length * 20);
-          for (let mi = 0; mi < members.length; mi++) {
-            const av = agentViews.get(members[mi]);
-            if (!av) continue;
-            const mAngle = -Math.PI / 2 + (mi / members.length) * Math.PI * 2;
-            av.targetX = gcx + Math.cos(mAngle) * subR;
-            av.targetY = gcy + Math.sin(mAngle) * subR;
-          }
+      // Tree layout: compute depth, center vertically
+      const subtreeWidth = new Map();
+      const subtreeDepth = new Map();
+      function computeColonyTree(key) {
+        const kids = children.get(key) || [];
+        if (kids.length === 0) {
+          subtreeWidth.set(key, 1);
+          subtreeDepth.set(key, 0);
+          return;
         }
+        let w = 0, maxD = 0;
+        for (const k of kids) {
+          computeColonyTree(k);
+          w += subtreeWidth.get(k) || 1;
+          maxD = Math.max(maxD, (subtreeDepth.get(k) || 0) + 1);
+        }
+        subtreeWidth.set(key, Math.max(w, 1));
+        subtreeDepth.set(key, maxD);
+      }
+      let totalRootWidth = 0;
+      let maxTreeDepth = 0;
+      for (const r of roots) {
+        computeColonyTree(r);
+        totalRootWidth += subtreeWidth.get(r) || 1;
+        maxTreeDepth = Math.max(maxTreeDepth, (subtreeDepth.get(r) || 0) + 1);
+      }
+
+      const V_SPACING = Math.min(100, (engine.height * 0.7) / Math.max(maxTreeDepth, 1));
+      const H_SPACING = Math.min(120, (engine.width * 0.85) / Math.max(totalRootWidth, 1));
+
+      function placeColonySubtree(key, left, top) {
+        const w = subtreeWidth.get(key) || 1;
+        const av = agentViews.get(key);
+        if (av) {
+          setColonyMode(av);
+          av.targetX = left + (w * H_SPACING) / 2;
+          av.targetY = top;
+        }
+        const kids = children.get(key) || [];
+        let childLeft = left;
+        for (const k of kids) {
+          const kw = subtreeWidth.get(k) || 1;
+          placeColonySubtree(k, childLeft, top + V_SPACING);
+          childLeft += kw * H_SPACING;
+        }
+      }
+
+      const totalW = totalRootWidth * H_SPACING;
+      const totalH = maxTreeDepth * V_SPACING;
+      let startX = cx - totalW / 2;
+      const startY = cy - totalH / 2;
+
+      for (const r of roots) {
+        const rw = subtreeWidth.get(r) || 1;
+        placeColonySubtree(r, startX, startY);
+        startX += rw * H_SPACING;
       }
     }
 
-    world.clusters = [{ project, cx, cy, radius: Math.min(engine.width, engine.height) * 0.42, hidden: true }];
+    // Hide other project agents off-screen
+    for (const [key, av] of agentViews) {
+      if (!keys.includes(key)) {
+        av.orbit = null;
+        av.colony = false;
+        av.targetX = -9999;
+        av.targetY = -9999;
+      }
+    }
 
-    // Neutralize camera — positions are screen-space
+    // Store planet type on world for colony rendering (planet in corner)
+    world.clusters = [];
+    world.colony = { project, solarPlanet, planetType };
+    world.sunCenter = null;
+    world.projectPlanets = [];
     engine.camera.snapTo(cx, cy, 1.0);
+
   } else {
-    // --- Multiple projects: clusters on a large circle ---
-    // Each cluster's inner radius fills proportionally
-    const clusterData = projects.map(project => {
-      const keys = projectGroups.get(project) || new Set();
-      const agentCount = keys.size;
-      // Inner radius: at least 120px spacing between agents, min 80
-      const minBySpacing = agentCount > 1 ? (120 * agentCount) / (2 * Math.PI) : 0;
-      const innerRadius = Math.max(minBySpacing, 80);
-      return { project, keys, agentCount, innerRadius };
-    });
+    // --- Galaxy view: planets representing projects (no sun, no agents visible) ---
 
-    const maxClusterRadius = Math.max(...clusterData.map(c => c.innerRadius));
-    const outerRadius = Math.max(maxClusterRadius * 2.5 + 200,
-      (300 * projects.length) / (2 * Math.PI));
-
-    const clusters = [];
-    for (let pi = 0; pi < clusterData.length; pi++) {
-      const { project, keys, agentCount, innerRadius } = clusterData[pi];
-
-      const outerAngle = -Math.PI / 2 + (pi / projects.length) * Math.PI * 2;
-      const clusterCx = cx + Math.cos(outerAngle) * outerRadius;
-      const clusterCy = cy + Math.sin(outerAngle) * outerRadius;
-
-      let i = 0;
-      for (const key of keys) {
-        const av = agentViews.get(key);
-        if (!av) continue;
-        if (agentCount === 1) {
-          av.targetX = clusterCx;
-          av.targetY = clusterCy;
-        } else {
-          const angle = -Math.PI / 2 + (i / agentCount) * Math.PI * 2;
-          av.targetX = clusterCx + Math.cos(angle) * innerRadius;
-          av.targetY = clusterCy + Math.sin(angle) * innerRadius;
-        }
-        i++;
-      }
-
-      clusters.push({ project, cx: clusterCx, cy: clusterCy, radius: innerRadius + 60 });
+    // Hide ALL agents in galaxy view
+    for (const [, av] of agentViews) {
+      av.orbit = null;
+      av.solarPlanet = null;
+      av.colony = false;
+      av.targetX = -9999;
+      av.targetY = -9999;
+      av.minimal = true;
     }
 
-    world.clusters = clusters;
+    // Layout project planets — preserve existing planet state (angles, orbits)
+    const projectList = projectsData.length > 0
+      ? projectsData
+      : projects.map(p => ({ name: p, planet_type: "terran/1", agent_count: (projectGroups.get(p) || new Set()).size }));
 
-    // Fit camera to show all clusters
-    if (focusedProject) {
-      const cluster = clusters.find(c => c.project === focusedProject);
-      if (cluster) fitToCluster(cluster);
-      else fitToAllClusters();
+    // Build a lookup of previous planets to preserve their orbit angle
+    const existingByName = new Map();
+    for (const ep of _prevPlanets) {
+      existingByName.set(ep.project, ep);
+    }
+
+    const projectPlanets = [];
+
+    // Planet size: 32-64px (max 80% of 80px sun)
+    const planetSize = (count) => Math.min(32 + Math.min(count * 3, 32), 64);
+
+    if (projectList.length === 1) {
+      const p = projectList[0];
+      const agentCount = p.agent_count || (projectGroups.get(p.name) || new Set()).size;
+      const existing = existingByName.get(p.name);
+      const orbitR = Math.min(engine.width, engine.height) * 0.25;
+      projectPlanets.push({
+        project: p.name,
+        planetType: p.planet_type || "terran/1",
+        orbitRadius: orbitR,
+        angle: existing ? existing.angle : 0,
+        speed: 0.03,
+        cx: cx + Math.cos(existing ? existing.angle : 0) * orbitR,
+        cy: cy + Math.sin(existing ? existing.angle : 0) * orbitR,
+        agentCount,
+        size: planetSize(agentCount),
+      });
     } else {
-      fitToAllClusters();
+      // Wide orbits that stay in canvas — 0.40 of viewport
+      // Sort by agent count so bigger planets orbit further out
+      const sorted = [...projectList].sort((a, b) => {
+        const ac = a.agent_count || (projectGroups.get(a.name) || new Set()).size;
+        const bc = b.agent_count || (projectGroups.get(b.name) || new Set()).size;
+        return ac - bc;
+      });
+      const outerRadius = Math.min(engine.width, engine.height) * 0.40;
+      for (let i = 0; i < sorted.length; i++) {
+        const p = sorted[i];
+        const agentCount = p.agent_count || (projectGroups.get(p.name) || new Set()).size;
+        const existing = existingByName.get(p.name);
+
+        const ratio = sorted.length <= 2 ? 0.55
+          : 0.55 + 0.45 * (i / Math.max(sorted.length - 1, 1));
+        const orbitR = outerRadius * ratio;
+        const startAngle = -Math.PI / 2 + (i / sorted.length) * Math.PI * 2;
+        const speed = 0.03 / Math.sqrt(ratio);
+
+        const angle = existing ? existing.angle : startAngle;
+
+        projectPlanets.push({
+          project: p.name,
+          planetType: p.planet_type || "terran/1",
+          orbitRadius: orbitR,
+          angle,
+          speed,
+          cx: cx + Math.cos(angle) * orbitR,
+          cy: cy + Math.sin(angle) * orbitR,
+          agentCount,
+          size: planetSize(agentCount),
+        });
+      }
+    }
+
+    world.sunCenter = { cx, cy };
+    world.projectPlanets = projectPlanets;
+    world.clusters = [];
+    world.colony = null;
+
+    // Pre-populate project stats for progress bars
+    for (const p of projectsData) {
+      world._projectStats[p.name] = {
+        total: p.agent_count, online: p.online_count,
+        tasks: p.total_tasks, active: p.active_tasks, done: p.done_tasks,
+      };
+    }
+
+    engine.camera.snapTo(cx, cy, 1.0);
+  }
+
+  // Teleport: snap agents to their target positions (skip lerp)
+  if (_teleportAgents) {
+    _teleportAgents = false;
+    for (const [, av] of agentViews) {
+      av.x = av.targetX;
+      av.y = av.targetY;
     }
   }
 }
@@ -274,6 +391,17 @@ function onAgents(agents) {
 
   const currentKeys = new Set(agents.map(a => agentKey(a.project || "default", a.name)));
 
+  // Detect structural changes (agents added/removed/changed project)
+  let structureChanged = false;
+  for (const key of currentKeys) {
+    if (!agentViews.has(key)) { structureChanged = true; break; }
+  }
+  if (!structureChanged) {
+    for (const key of agentViews.keys()) {
+      if (!currentKeys.has(key)) { structureChanged = true; break; }
+    }
+  }
+
   // Remove agents that no longer exist
   for (const [key, av] of agentViews) {
     if (!currentKeys.has(key)) {
@@ -313,6 +441,7 @@ function onAgents(agents) {
     av._teams = a.teams || [];
     av.session_id = a.session_id || null;
     av.sleeping = a.status === "sleeping";
+    // Planet type now comes from project, not agent
     // Apply activity from agents API (enriched by ingester)
     if (a.activity && a.activity !== "idle") {
       av.activity = a.activity;
@@ -328,15 +457,19 @@ function onAgents(agents) {
 
   agentsData = agents;
 
-  // Only show project tags when there are multiple projects
-  const multiProject = projectGroups.size > 1;
+  // In colony view, show project tags only if somehow multiple projects
+  // In galaxy view, agents are hidden (off-screen), no need for tags
   for (const [, av] of agentViews) {
-    av.showProjectTag = multiProject;
+    av.showProjectTag = false;
+    av.minimal = viewMode === "galaxy";
   }
 
-  layoutAgents();
+  // Only re-layout if agents were added/removed — preserve orbits on routine polls
+  if (structureChanged || firstLayout) {
+    layoutAgents();
+    updateHierarchyLinks();
+  }
   updateHighlights();
-  updateHierarchyLinks();
 }
 
 function onActivity(sessions, sseAgents) {
@@ -372,35 +505,7 @@ function onActivity(sessions, sseAgents) {
     }
   }
 
-  for (const s of sessions) {
-    if (matchedSessionIDs.has(s.session_id)) continue;
-
-    // Unmatched session → ghost sprite
-    const ghostName = "session:" + s.session_id.slice(0, 8);
-    if (!agentViews.has(ghostName)) {
-      const av = new AgentView(ghostName, s.tool || "unknown", "", paletteCounter++, true, "default");
-      av.session_id = s.session_id;
-      av._isGhost = true;
-      av.setPosition(
-        engine.width / 4 + Math.random() * engine.width / 2,
-        engine.height / 4 + Math.random() * engine.height / 2,
-      );
-      av.spawnEffect();
-      agentViews.set(ghostName, av);
-      engine.add(av);
-    }
-    const av = agentViews.get(ghostName);
-    av.role = s.tool || av.role;
-    applyActivity(av, s);
-  }
-
-  // Remove ghost sprites for sessions that disappeared
-  for (const [key, av] of agentViews) {
-    if (av._isGhost && !sessions.find(s => s.session_id === av.session_id)) {
-      engine.remove(av);
-      agentViews.delete(key);
-    }
-  }
+  // Ghost sprites disabled — only registered agents appear on canvas
 }
 
 function applyActivity(av, s) {
@@ -658,10 +763,15 @@ function appendMessage(msg, showConv = false, useTypewriter = false) {
 // --- Hierarchy links ---
 
 function updateHierarchyLinks() {
+  // Hide hierarchy lines in galaxy view
+  connectionOverlay.showHierarchy = viewMode === "colony";
+  if (viewMode === "galaxy") {
+    world.hierarchyLinks = [];
+    return;
+  }
   const links = [];
   for (const [, av] of agentViews) {
     if (av._reportsTo) {
-      // Look up manager within the same project
       const managerKey = agentKey(av.project, av._reportsTo);
       const managerAv = agentViews.get(managerKey);
       if (managerAv) {
@@ -706,6 +816,29 @@ function userMsgTypeLabel(cat) {
   }
 }
 
+const UQ_ICONS = {
+  question: "/img/ui/icons/large/chromatic_aberration/questionmark.png",
+  notification: "/img/ui/icons/large/chromatic_aberration/exclamation.png",
+  response: "/img/ui/icons/large/chromatic_aberration/thumbs_up.png",
+  task: "/img/ui/icons/large/chromatic_aberration/interrobang.png",
+};
+
+function _uqLoadingWheel() {
+  const el = document.createElement("span");
+  el.className = "uq-loading-wheel";
+  let frame = 1;
+  const img = document.createElement("img");
+  img.src = `/img/ui/loading_wheel/loading_whee1.png`;
+  img.width = 16; img.height = 16;
+  el.appendChild(img);
+  el._interval = setInterval(() => {
+    frame = (frame % 11) + 1;
+    img.src = `/img/ui/loading_wheel/loading_whee${frame}.png`;
+  }, 90);
+  el._destroy = () => clearInterval(el._interval);
+  return el;
+}
+
 function showUserCard(msg) {
   const cat = userMsgCategory(msg);
   const card = document.createElement("div");
@@ -720,10 +853,14 @@ function showUserCard(msg) {
 
   let html = `
     <div class="uq-header">
-      <span class="uq-from">${escapeHtml(fromLabel)}</span>
-      <span class="uq-type">${userMsgTypeLabel(cat)}</span>
+      <img class="uq-icon" src="${UQ_ICONS[cat] || UQ_ICONS.notification}" alt="${cat}" />
+      <div class="uq-header-text">
+        <span class="uq-from">${escapeHtml(fromLabel)}</span>
+        <span class="uq-type">${userMsgTypeLabel(cat)}</span>
+      </div>
     </div>
-    <button class="uq-dismiss">&times;</button>
+    <button class="uq-dismiss"><img src="/img/ui/icons/small/x.png" width="10" height="10" /></button>
+    <span class="uq-project" data-project="${escapeHtml(msgProject)}">${escapeHtml(msgProject)}</span>
   `;
 
   if (subject) html += `<div class="uq-subject">${escapeHtml(subject)}</div>`;
@@ -737,6 +874,11 @@ function showUserCard(msg) {
   }
 
   card.innerHTML = html;
+
+  // Navigate to project on click
+  card.querySelector(".uq-project").addEventListener("click", () => {
+    _navigateToProject(msgProject);
+  });
 
   // Dismiss button
   card.querySelector(".uq-dismiss").addEventListener("click", () => {
@@ -765,9 +907,12 @@ function showUserCard(msg) {
       const response = textarea.value.trim();
       if (!response) return;
       button.disabled = true;
-      button.textContent = "Sending...";
+      button.textContent = "";
+      const loader = _uqLoadingWheel();
+      button.appendChild(loader);
 
       const ok = await client.sendUserResponse(msgProject, msg.from, response, msg.id);
+      loader._destroy();
       if (ok) {
         card.style.opacity = "0";
         card.style.transition = "opacity 0.3s ease";
@@ -782,6 +927,38 @@ function showUserCard(msg) {
   userQuestionsPanel.appendChild(card);
 }
 
+function _navigateToProject(project, mode, taskId) {
+  // If already in this colony, just switch mode
+  if (viewMode === "colony" && colonyProject === project) {
+    if (mode === "kanban") {
+      setMode("kanban");
+      if (taskId) setTimeout(() => kanbanBoard.highlightTask(taskId), 200);
+    }
+    return;
+  }
+  // Find the planet for this project and zoom in
+  const planet = world.projectPlanets.find(p => p.project === project);
+  if (planet) {
+    zoomIntoColony(planet);
+    if (mode === "kanban") {
+      // Wait for colony to load, then switch to kanban
+      setTimeout(() => {
+        setMode("kanban");
+        if (taskId) setTimeout(() => kanbanBoard.highlightTask(taskId), 300);
+      }, 700);
+    }
+  } else {
+    // No planet found, direct navigation
+    setViewMode("colony", project);
+    if (mode === "kanban") {
+      setTimeout(() => {
+        setMode("kanban");
+        if (taskId) setTimeout(() => kanbanBoard.highlightTask(taskId), 300);
+      }, 200);
+    }
+  }
+}
+
 function showUserTaskCard(task) {
   const card = document.createElement("div");
   const prio = task.priority || "P2";
@@ -791,20 +968,36 @@ function showUserTaskCard(task) {
 
   const from = task.dispatched_by || "agent";
   const prioIcon = isP0 ? "\u26A0" : prio === "P1" ? "\u25B2" : "\u25CF";
+  const taskProject = task.project || "default";
 
   card.innerHTML = `
     <div class="uq-header">
-      <span class="uq-from">${escapeHtml(from)} ${prioIcon}</span>
-      <span class="uq-type">${escapeHtml(prio)} TASK</span>
+      <img class="uq-icon" src="${UQ_ICONS.task}" alt="task" />
+      <div class="uq-header-text">
+        <span class="uq-from">${escapeHtml(from)} ${prioIcon}</span>
+        <span class="uq-type">${escapeHtml(prio)} TASK</span>
+      </div>
     </div>
-    <button class="uq-dismiss">&times;</button>
+    <button class="uq-dismiss"><img src="/img/ui/icons/small/x.png" width="10" height="10" /></button>
+    <span class="uq-project" data-project="${escapeHtml(taskProject)}">${escapeHtml(taskProject)}</span>
     <div class="uq-subject">${escapeHtml(task.title || "(untitled)")}</div>
     ${task.description ? `<div class="uq-content">${escapeHtml(task.description)}</div>` : ""}
-    <div style="display:flex;gap:6px;margin-top:10px;">
+    <div class="uq-actions">
       <button class="uq-respond-btn" data-action="accept">Accept</button>
-      <button class="uq-respond-btn" data-action="done" style="background:#00e676;color:#0a0a12;">Complete</button>
+      <button class="uq-respond-btn uq-respond-btn--done" data-action="done">Complete</button>
+      <button class="uq-respond-btn uq-respond-btn--nav" data-action="kanban"><img src="/img/ui/icons/small/arrow_right.png" width="8" height="8" class="uq-btn-icon" />Kanban</button>
     </div>
   `;
+
+  // Navigate to project
+  card.querySelector(".uq-project").addEventListener("click", () => {
+    _navigateToProject(taskProject);
+  });
+
+  // Navigate to kanban + highlight task
+  card.querySelector('[data-action="kanban"]').addEventListener("click", () => {
+    _navigateToProject(taskProject, "kanban", task.id);
+  });
 
   card.querySelector(".uq-dismiss").addEventListener("click", () => {
     card.style.opacity = "0";
@@ -950,6 +1143,13 @@ function openDetail(av) {
     }
   }
 
+  // Dim other agents
+  for (const [key, other] of agentViews) {
+    const isFocused = key === focusedAgent;
+    other.highlighted = isFocused;
+    other.dimMode = !isFocused;
+  }
+
   // Filter messages to this agent
   loadMessages();
 }
@@ -957,6 +1157,11 @@ function openDetail(av) {
 detailClose.addEventListener("click", () => {
   detailPanel.classList.remove("open");
   focusedAgent = null;
+  // Restore all agents
+  for (const [, av] of agentViews) {
+    av.highlighted = true;
+    av.dimMode = false;
+  }
   loadMessages();
 });
 
@@ -1026,7 +1231,42 @@ canvas.addEventListener("mousemove", (e) => {
     hoveredAgentKey = newHovered;
   }
 
-  canvas.style.cursor = newHovered ? "pointer" : "default";
+  // Planet hover detection (galaxy view only)
+  let newHoveredPlanet = null;
+  if (viewMode === "galaxy" && world.projectPlanets.length > 0) {
+    for (const planet of world.projectPlanets) {
+      const hitR = planet.size * 0.6;
+      const dx = wp.x - planet.cx;
+      const dy = wp.y - planet.cy;
+      if (dx * dx + dy * dy <= hitR * hitR) {
+        newHoveredPlanet = planet.project;
+        break;
+      }
+    }
+  }
+  world.hoveredPlanet = newHoveredPlanet;
+  // Provide project stats for tooltip
+  if (newHoveredPlanet && !world._projectStats) world._projectStats = {};
+  if (newHoveredPlanet) {
+    const p = newHoveredPlanet;
+    // Prefer projectsData (from /api/projects with pre-computed stats)
+    const projInfo = projectsData.find(pi => pi.name === p);
+    if (projInfo) {
+      world._projectStats[p] = {
+        total: projInfo.agent_count, online: projInfo.online_count,
+        tasks: projInfo.total_tasks, active: projInfo.active_tasks, done: projInfo.done_tasks,
+      };
+    } else {
+      const agents = agentsData.filter(a => (a.project || "default") === p);
+      const online = agents.filter(a => a.online || a.status === "busy").length;
+      const tasks = allTasks.filter(t => (t.project || "default") === p);
+      const active = tasks.filter(t => t.status === "in-progress").length;
+      const done = tasks.filter(t => t.status === "done").length;
+      world._projectStats[p] = { total: agents.length, online, tasks: tasks.length, active, done };
+    }
+  }
+
+  canvas.style.cursor = (newHovered || newHoveredPlanet) ? "pointer" : "default";
 });
 
 canvas.addEventListener("mouseup", () => {
@@ -1061,9 +1301,9 @@ canvas.addEventListener("click", (e) => {
     }
   }
 
-  // 2. Check team group hit (single-project mode: click near a team cluster)
-  if (projectGroups.size <= 1) {
-    const project = ([...projectGroups.keys()][0]) || "default";
+  // 2. Check team group hit (colony mode: click near a team cluster)
+  if (viewMode === "colony" && colonyProject) {
+    const project = colonyProject;
     // Collect unique team slugs
     const seenTeams = new Set();
     for (const a of agentsData) {
@@ -1112,34 +1352,161 @@ canvas.addEventListener("click", (e) => {
     }
   }
 
-  // 3. Check cluster hit — click inside a cluster circle → zoom to that project
-  for (const cluster of world.clusters) {
-    const dx = wp.x - cluster.cx;
-    const dy = wp.y - cluster.cy;
-    if (dx * dx + dy * dy <= cluster.radius * cluster.radius) {
-      if (focusedProject !== cluster.project) {
-        focusedProject = cluster.project;
-        focusedAgent = null;
-        focusedTeam = null;
-        detailPanel.classList.remove("open");
-        fitToCluster(cluster);
-        loadMessages();
+  // 3. Check project planet hit → zoom-in animation then enter colony view
+  if (viewMode === "galaxy") {
+    for (const planet of world.projectPlanets) {
+      const hitR = planet.size * 0.6;
+      const dx = wp.x - planet.cx;
+      const dy = wp.y - planet.cy;
+      if (dx * dx + dy * dy <= hitR * hitR) {
+        zoomIntoColony(planet);
         return;
       }
-      // Already focused on this cluster — do nothing
+    }
+    return; // Galaxy: click on empty space does nothing
+  }
+
+  // 4. Colony: click on empty space → clear focus (stay in colony)
+  detailPanel.classList.remove("open");
+  focusedAgent = null;
+  focusedTeam = null;
+  loadMessages();
+});
+
+// --- Asset picker (right-click sun / planet in galaxy view) ---
+const assetPicker = document.getElementById("asset-picker");
+const assetPickerTitle = document.getElementById("asset-picker-title");
+const assetPickerGrid = document.getElementById("asset-picker-grid");
+let currentDysonType = null; // null = cycle all, "1"-"7" = fixed, "off" = none
+
+function closeAssetPicker() {
+  assetPicker.classList.add("hidden");
+}
+
+function openDysonPicker() {
+  assetPickerTitle.textContent = "DYSON SPHERE";
+  assetPickerGrid.innerHTML = "";
+  // "Cycle all" option
+  const cycleItem = document.createElement("div");
+  cycleItem.className = "picker-item" + (!currentDysonType ? " selected" : "");
+  cycleItem.innerHTML = `<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:8px;color:#ffd250;font-family:'JetBrains Mono',monospace">AUTO</div>`;
+  cycleItem.addEventListener("click", async () => {
+    currentDysonType = null;
+    world._dysonType = null;
+    await client.updateSettings({ dyson_type: "auto" });
+    closeAssetPicker();
+  });
+  assetPickerGrid.appendChild(cycleItem);
+  // "Off" option
+  const offItem = document.createElement("div");
+  offItem.className = "picker-item" + (currentDysonType === "off" ? " selected" : "");
+  offItem.innerHTML = `<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:8px;color:#888;font-family:'JetBrains Mono',monospace">OFF</div>`;
+  offItem.addEventListener("click", async () => {
+    currentDysonType = "off";
+    world._dysonType = "off";
+    await client.updateSettings({ dyson_type: "off" });
+    closeAssetPicker();
+  });
+  assetPickerGrid.appendChild(offItem);
+  // Individual frames
+  for (let i = 1; i <= 7; i++) {
+    const item = document.createElement("div");
+    item.className = "picker-item" + (currentDysonType === String(i) ? " selected" : "");
+    const img = new Image();
+    img.src = `/img/space/dyson/${i}.png`;
+    item.appendChild(img);
+    item.addEventListener("click", async () => {
+      currentDysonType = String(i);
+      world._dysonType = currentDysonType;
+      await client.updateSettings({ dyson_type: currentDysonType });
+      closeAssetPicker();
+    });
+    assetPickerGrid.appendChild(item);
+  }
+  assetPicker.classList.remove("hidden");
+}
+
+// Load dyson_type from settings on init
+(async () => {
+  const settings = await client.fetchSettings();
+  if (settings.dyson_type && settings.dyson_type !== "auto") {
+    currentDysonType = settings.dyson_type;
+    world._dysonType = currentDysonType;
+  }
+})();
+
+function openPlanetPicker(projectName) {
+  const projInfo = projectsData.find(p => p.name === projectName);
+  const currentType = projInfo ? projInfo.planet_type : "";
+  assetPickerTitle.textContent = `PLANET: ${projectName.toUpperCase()}`;
+  assetPickerGrid.innerHTML = "";
+  for (const pt of spaceAssets.planetTypes) {
+    const item = document.createElement("div");
+    item.className = "picker-item" + (pt === currentType ? " selected" : "");
+    const img = new Image();
+    img.src = `/img/space/animated/${pt}/1.png`;
+    item.appendChild(img);
+    const label = document.createElement("div");
+    label.className = "picker-label";
+    label.textContent = pt.replace("/", " ");
+    item.appendChild(label);
+    item.addEventListener("click", async () => {
+      const ok = await client.updateProjectPlanet(projectName, pt);
+      if (ok) {
+        // Refresh from DB to ensure persistence
+        await fetchProjectsData();
+        // Also update current world planet immediately
+        const planet = world.projectPlanets.find(p => p.project === projectName);
+        if (planet) planet.planetType = pt;
+      }
+      closeAssetPicker();
+    });
+    assetPickerGrid.appendChild(item);
+  }
+  assetPicker.classList.remove("hidden");
+}
+
+canvas.addEventListener("contextmenu", (e) => {
+  if (viewMode !== "galaxy") return;
+  e.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const sx = e.clientX - rect.left;
+  const sy = e.clientY - rect.top;
+  const wp = engine.camera.screenToWorld(sx, sy, engine.width, engine.height);
+
+  // Check sun hit (right-click to change Dyson sphere)
+  if (world.sunCenter) {
+    const dx = wp.x - world.sunCenter.cx;
+    const dy = wp.y - world.sunCenter.cy;
+    if (dx * dx + dy * dy <= 80 * 80) {
+      openDysonPicker();
       return;
     }
   }
 
-  // 4. Click on empty space → zoom back to show all, clear focus
-  detailPanel.classList.remove("open");
-  focusedAgent = null;
-  focusedTeam = null;
-  if (focusedProject) {
-    focusedProject = null;
-    fitToAllClusters();
+  // Check planet hit (right-click to change planet type)
+  for (const planet of world.projectPlanets) {
+    const hitR = planet.size * 0.6;
+    const dx = wp.x - planet.cx;
+    const dy = wp.y - planet.cy;
+    if (dx * dx + dy * dy <= hitR * hitR) {
+      openPlanetPicker(planet.project);
+      return;
+    }
   }
-  loadMessages();
+});
+
+// Close picker on click outside or Escape
+document.addEventListener("click", (e) => {
+  if (!assetPicker.classList.contains("hidden") && !assetPicker.contains(e.target)) {
+    closeAssetPicker();
+  }
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !assetPicker.classList.contains("hidden")) {
+    closeAssetPicker();
+    e.stopPropagation();
+  }
 });
 
 // Zoom with wheel
@@ -1429,6 +1796,119 @@ function getViewFilteredTasks() {
   return allTasks;
 }
 
+// --- Quest Tracker HUD ---
+
+const questTracker = document.getElementById("quest-tracker");
+const questTrackerBody = document.getElementById("quest-tracker-body");
+const qtToggle = document.getElementById("qt-toggle");
+const qtHeader = document.getElementById("quest-tracker-header");
+
+if (qtHeader) {
+  qtHeader.addEventListener("click", () => {
+    questTracker.classList.toggle("collapsed");
+  });
+}
+
+let _questCache = [];
+
+async function updateQuestTracker() {
+  if (!focusedProject) {
+    if (questTracker) questTracker.classList.add("hidden");
+    return;
+  }
+  const cascade = await client.fetchGoalCascade(focusedProject);
+  _questCache = cascade;
+  renderQuestTracker(cascade);
+}
+
+function renderQuestTracker(goals) {
+  if (!questTrackerBody || !questTracker) return;
+
+  // Show only in colony view
+  if (viewMode !== "colony") {
+    questTracker.classList.add("hidden");
+    return;
+  }
+
+  if (!goals || goals.length === 0) {
+    questTracker.classList.add("hidden");
+    return;
+  }
+
+  questTracker.classList.remove("hidden");
+
+  const statusIcon = (status) => {
+    switch (status) {
+      case "done": case "completed": return `<span class="qt-task-icon done">\u2714</span>`;
+      case "in-progress": case "in_progress": return `<span class="qt-task-icon in-progress">\u25B6</span>`;
+      case "blocked": return `<span class="qt-task-icon blocked">\u2716</span>`;
+      default: return `<span class="qt-task-icon pending">\u25CB</span>`;
+    }
+  };
+
+  const krIcon = (g) => {
+    if (g.progress >= 1) return `<span class="qt-kr-icon done">\u2714</span>`;
+    if (g.progress > 0) return `<span class="qt-kr-icon active">\u25B6</span>`;
+    return `<span class="qt-kr-icon pending">\u25CB</span>`;
+  };
+
+  const progressBar = (progress) => {
+    const pct = Math.round(progress * 100);
+    const cls = pct >= 100 ? "green" : pct > 0 ? "yellow" : "red";
+    return `<div class="qt-progress"><div class="qt-progress-fill ${cls}" style="width:${pct}%"></div></div>`;
+  };
+
+  // Recursive renderer — supports any goal type at any depth
+  const renderGoal = (g, depth) => {
+    let out = "";
+    if (depth === 0) {
+      // Root level = mission style
+      out += `<div class="qt-mission">`;
+      out += `<div class="qt-mission-title">${esc(g.title)}</div>`;
+      out += progressBar(g.progress);
+    } else if (depth === 1) {
+      // Objective level
+      const pct = Math.round(g.progress * 100);
+      out += `<div class="qt-objective">`;
+      out += `<div class="qt-obj-row"><span class="qt-obj-title">${esc(g.title)}</span><span class="qt-obj-pct">${pct}%</span></div>`;
+      out += progressBar(g.progress);
+    } else {
+      // Key result / leaf level
+      out += `<div class="qt-kr"><div class="qt-kr-row">`;
+      out += krIcon(g);
+      out += `<span class="qt-kr-title">${esc(g.title)}</span>`;
+      if (g.owner_agent) out += `<span class="qt-kr-agent">${esc(g.owner_agent)}</span>`;
+      out += `</div></div>`;
+    }
+
+    if (g.children && g.children.length > 0) {
+      for (const child of g.children) {
+        out += renderGoal(child, depth + 1);
+      }
+    }
+
+    if (depth <= 1) out += `</div>`;
+    return out;
+  };
+
+  let html = "";
+  for (const g of goals) {
+    html += renderGoal(g, 0);
+  }
+
+  if (!html) {
+    questTracker.classList.add("hidden");
+    return;
+  }
+
+  questTrackerBody.innerHTML = html;
+}
+
+function esc(s) {
+  if (!s) return "";
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 function renderTasks() {
   const status = tasksStatusFilter.value;
   const priority = tasksPriorityFilter.value;
@@ -1673,12 +2153,15 @@ function updateConvFilterOptions() {
 
 // --- Layout modes ---
 
-let currentMode = "canvas"; // "canvas" | "detail" | "kanban"
+let currentMode = "canvas"; // "canvas" | "detail" | "kanban" | "vault"
+let viewMode = "galaxy"; // "galaxy" | "colony" — top-level screen state
+let projectsData = []; // cached ProjectInfo[] from /api/projects
+let colonyProject = null; // project name when in colony view
 
 function setMode(mode) {
   currentMode = mode;
   const main = document.getElementById("main");
-  main.classList.remove("mode-canvas", "mode-detail", "mode-kanban");
+  main.classList.remove("mode-canvas", "mode-detail", "mode-kanban", "mode-vault");
   main.classList.add(`mode-${mode}`);
 
   // Update header mode buttons
@@ -1689,10 +2172,10 @@ function setMode(mode) {
   // Show/hide kanban
   if (mode === "kanban") {
     kanbanBoard.show();
-    // Fetch all tasks + boards, then filter by current view context
-    Promise.all([client.fetchAllTasks(), client.fetchAllBoards()]).then(([tasks, boards]) => {
+    Promise.all([client.fetchAllTasks(), client.fetchAllBoards(), client.fetchAllGoals()]).then(([tasks, boards, goals]) => {
       allTasks = tasks;
       kanbanBoard.setBoards(boards);
+      kanbanBoard.setGoals(goals);
       kanbanBoard.setTasks(getViewFilteredTasks());
       taskCountEl.textContent = allTasks.filter(t => t.status !== "done").length;
     });
@@ -1700,8 +2183,20 @@ function setMode(mode) {
     kanbanBoard.hide();
   }
 
-  // Messages panel: hidden in kanban mode
-  if (mode === "kanban") {
+  // Show/hide vault
+  if (mode === "vault") {
+    vaultBrowser.show();
+    const project = focusedProject || "";
+    const fetchDocs = project ? client.fetchVaultDocs(project) : client.fetchAllVaultDocs();
+    fetchDocs.then(docs => {
+      vaultBrowser.setDocs(docs);
+    });
+  } else {
+    vaultBrowser.hide();
+  }
+
+  // Messages panel: hidden in kanban/vault mode
+  if (mode === "kanban" || mode === "vault") {
     messagesPanel.classList.add("hidden");
     memoriesPanel.classList.add("hidden");
     tasksPanel.classList.add("hidden");
@@ -1718,6 +2213,161 @@ function setMode(mode) {
 document.querySelectorAll(".mode-btn").forEach(btn => {
   btn.addEventListener("click", () => setMode(btn.dataset.mode));
 });
+
+// --- Galaxy / Colony view mode ---
+
+const backGalaxyBtn = document.getElementById("back-galaxy");
+const colonyProjectNameEl = document.getElementById("colony-project-name");
+
+let _zoomAnimating = false;
+
+function zoomIntoColony(planet) {
+  if (_zoomAnimating) return;
+  _zoomAnimating = true;
+
+  const canvas = document.getElementById("relay-canvas");
+  const container = document.getElementById("canvas-container");
+  if (!canvas || !container) {
+    setViewMode("colony", planet.project);
+    _zoomAnimating = false;
+    return;
+  }
+
+  // Phase 1: Zoom into planet on galaxy canvas
+  const originX = ((planet.cx / canvas.width) * 100).toFixed(1);
+  const originY = ((planet.cy / canvas.height) * 100).toFixed(1);
+  canvas.style.transformOrigin = `${originX}% ${originY}%`;
+  canvas.style.transition = "transform 0.5s cubic-bezier(0.4, 0, 0.2, 1)";
+  canvas.style.transform = "scale(3)";
+
+  // Create flash overlay
+  let flash = container.querySelector(".colony-flash");
+  if (!flash) {
+    flash = document.createElement("div");
+    flash.className = "colony-flash";
+    container.appendChild(flash);
+  }
+
+  // Phase 2: White flash at peak of zoom
+  setTimeout(() => {
+    flash.classList.add("active");
+  }, 350);
+
+  // Phase 3: Switch to colony behind the flash, then fade flash out
+  setTimeout(() => {
+    canvas.style.transition = "none";
+    canvas.style.transform = "";
+    canvas.style.transformOrigin = "";
+
+    _teleportAgents = true;
+    setViewMode("colony", planet.project);
+
+    // Let colony render one frame, then fade flash out
+    requestAnimationFrame(() => {
+      flash.classList.remove("active");
+      flash.classList.add("fading");
+
+      setTimeout(() => {
+        flash.classList.remove("fading");
+        _zoomAnimating = false;
+      }, 500);
+    });
+  }, 550);
+}
+
+function zoomOutToGalaxy() {
+  if (_zoomAnimating) return;
+  _zoomAnimating = true;
+
+  const canvas = document.getElementById("relay-canvas");
+  const container = document.getElementById("canvas-container");
+  if (!canvas || !container) {
+    setViewMode("galaxy");
+    _zoomAnimating = false;
+    return;
+  }
+
+  // Phase 1: Flash overlay
+  let flash = container.querySelector(".colony-flash");
+  if (!flash) {
+    flash = document.createElement("div");
+    flash.className = "colony-flash";
+    container.appendChild(flash);
+  }
+  flash.classList.add("active");
+
+  // Phase 2: Switch to galaxy behind flash, start zoomed in, then zoom out
+  setTimeout(() => {
+    // Pre-scale canvas before switching
+    canvas.style.transition = "none";
+    canvas.style.transform = "scale(3)";
+    canvas.style.transformOrigin = "50% 50%";
+
+    setViewMode("galaxy");
+
+    requestAnimationFrame(() => {
+      // Fade flash out while zooming out
+      flash.classList.remove("active");
+      flash.classList.add("fading");
+
+      canvas.style.transition = "transform 0.5s cubic-bezier(0.4, 0, 0.2, 1)";
+      canvas.style.transform = "scale(1)";
+
+      setTimeout(() => {
+        flash.classList.remove("fading");
+        canvas.style.transition = "none";
+        canvas.style.transform = "";
+        canvas.style.transformOrigin = "";
+        _zoomAnimating = false;
+      }, 500);
+    });
+  }, 200);
+}
+
+function setViewMode(mode, project) {
+  viewMode = mode;
+  document.body.classList.remove("view-galaxy", "view-colony");
+  document.body.classList.add(`view-${mode}`);
+
+  if (mode === "galaxy") {
+    colonyProject = null;
+    focusedProject = null;
+    focusedAgent = null;
+    focusedTeam = null;
+    detailPanel.classList.remove("open");
+    setMode("canvas");
+    if (questTracker) questTracker.classList.add("hidden");
+    // Defer layout to after DOM reflow so engine.width reflects new container size
+    requestAnimationFrame(() => { engine.resize(); layoutAgents(); updateHierarchyLinks(); });
+  } else if (mode === "colony" && project) {
+    colonyProject = project;
+    focusedProject = project;
+    focusedAgent = null;
+    focusedTeam = null;
+    if (colonyProjectNameEl) colonyProjectNameEl.textContent = project.toUpperCase();
+    setMode("canvas");
+    requestAnimationFrame(() => { engine.resize(); layoutAgents(); updateHierarchyLinks(); });
+    loadMessages();
+    if (activeTab === "tasks") renderTasks();
+    updateQuestTracker();
+  }
+}
+
+if (backGalaxyBtn) {
+  backGalaxyBtn.addEventListener("click", () => zoomOutToGalaxy());
+}
+
+async function fetchProjectsData() {
+  const prev = projectsData.length;
+  projectsData = await client.fetchProjects();
+  // Re-layout if project list changed (new project appeared, etc.)
+  if (projectsData.length !== prev && viewMode === "galaxy") {
+    layoutAgents();
+  }
+}
+
+// Initialize view mode
+document.body.classList.add("view-galaxy");
 
 // --- Typewriter effect for new messages ---
 
@@ -1769,6 +2419,7 @@ kanbanBoard.onDispatch = async (data) => {
     description: data.description,
     priority: data.priority,
     parent_task_id: data.parent_task_id || undefined,
+    goal_id: data.goal_id || undefined,
   });
   if (result) {
     allTasks.push(result);
@@ -1797,26 +2448,93 @@ kanbanBoard.onEdit = async (taskId, project, data) => {
   }
 };
 
+// --- Vault browser ---
+
+const vaultPanel = document.getElementById("vault-panel");
+const vaultBrowser = new VaultBrowser(vaultPanel);
+vaultBrowser.hide();
+
+vaultBrowser.onSearch = async (query) => {
+  const project = focusedProject || "";
+  const result = await client.searchVaultDocs(project, query);
+  vaultBrowser.setSearchResults(result.results || []);
+};
+
+vaultBrowser.onSelectDoc = async (path) => {
+  const project = focusedProject || "";
+  const doc = await client.fetchVaultDoc(project, path);
+  if (doc) vaultBrowser.showDocContent(doc);
+};
+
+vaultBrowser.onSaveDoc = async (path, content) => {
+  const project = focusedProject || "";
+  return await client.updateVaultDoc(project, path, content);
+};
+
 // --- Keyboard shortcuts ---
 
 const shortcuts = new ShortcutManager();
 
-shortcuts.register("1", "mode-canvas", "Canvas mode", () => setMode("canvas"));
-shortcuts.register("3", "mode-kanban", "Kanban mode", () => setMode("kanban"));
-shortcuts.register("Escape", "close", "Close / return to default", () => {
+// Colony canvas sub-views
+shortcuts.register("1", "mode-canvas", "Agents view", () => {
+  if (viewMode === "colony") setMode("canvas");
+});
+shortcuts.register("2", "mode-kanban", "Kanban view", () => {
+  if (viewMode === "colony") setMode("kanban");
+});
+shortcuts.register("3", "mode-vault", "Docs view", () => {
+  if (viewMode === "colony") setMode("vault");
+});
+
+// Colony sidebar tabs
+shortcuts.register("m", "tab-messages", "Messages tab", () => {
+  if (viewMode !== "colony") return;
+  tabMessages.click();
+});
+shortcuts.register("y", "tab-memories", "Memories tab", () => {
+  if (viewMode !== "colony") return;
+  tabMemories.click();
+});
+shortcuts.register("t", "tab-tasks", "Tasks tab", () => {
+  if (viewMode !== "colony") return;
+  tabTasks.click();
+});
+
+shortcuts.register("Escape", "close", "Close / return to galaxy", () => {
   if (detailPanel.classList.contains("open")) {
     detailPanel.classList.remove("open");
     focusedAgent = null;
     loadMessages();
-  } else if (currentMode !== "canvas") {
+  } else if (viewMode === "colony" && currentMode !== "canvas") {
     setMode("canvas");
+  } else if (viewMode === "colony") {
+    zoomOutToGalaxy();
   }
 });
+shortcuts.register("g", "galaxy", "Back to galaxy", () => {
+  if (viewMode === "colony") zoomOutToGalaxy();
+});
+shortcuts.register("ArrowUp", "colony-prev", "Previous colony", () => {
+  if (viewMode !== "colony" || !projectsData.length) return;
+  const names = projectsData.map(p => p.name);
+  const idx = names.indexOf(colonyProject);
+  const prev = (idx - 1 + names.length) % names.length;
+  const planet = world.projectPlanets.find(p => p.project === names[prev]) || { project: names[prev] };
+  setViewMode("colony", names[prev]);
+});
+shortcuts.register("ArrowDown", "colony-next", "Next colony", () => {
+  if (viewMode !== "colony" || !projectsData.length) return;
+  const names = projectsData.map(p => p.name);
+  const idx = names.indexOf(colonyProject);
+  const next = (idx + 1) % names.length;
+  setViewMode("colony", names[next]);
+});
 shortcuts.register("/", "search", "Focus search", () => {
-  if (currentMode === "kanban") return;
+  if (viewMode !== "colony" || currentMode === "kanban") return;
   if (msgSearchInput) msgSearchInput.focus();
 });
 shortcuts.register("n", "new-task", "New task", () => {
+  if (viewMode !== "colony") return;
   if (currentMode !== "kanban") setMode("kanban");
   kanbanBoard._showDispatchForm();
 });
@@ -1881,12 +2599,24 @@ shortcuts.start();
 
 console.log("[relay] UI initializing...");
 const client = new APIClient(onAgents, onConversations, onNewMessages, onNewTasks, onActivity);
-client.start();
-loadMessages();
-loadTasks();
-fetchTeamsData();
-_teamsFetchTimer = setInterval(fetchTeamsData, 10000);
-console.log("[relay] polling started");
+client.onGoals = (goals) => {
+  if (currentMode === "kanban") {
+    kanbanBoard.setGoals(goals);
+  }
+};
+// Defer start to after first paint so canvas has correct dimensions
+requestAnimationFrame(() => {
+  engine.resize();
+  client.start();
+  loadMessages();
+  loadTasks();
+  fetchTeamsData();
+  fetchProjectsData();
+  _teamsFetchTimer = setInterval(fetchTeamsData, 10000);
+  setInterval(fetchProjectsData, 10000);
+  setInterval(() => { if (viewMode === "colony") updateQuestTracker(); }, 15000);
+  console.log("[relay] polling started");
+});
 
 // --- Help modal ---
 const helpBtn = document.getElementById("help-btn");
