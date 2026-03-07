@@ -12,6 +12,7 @@ import (
 	"agent-relay/internal/db"
 	"agent-relay/internal/ingest"
 	"agent-relay/internal/relay"
+	"agent-relay/internal/vault"
 )
 
 var Version = "dev"
@@ -62,7 +63,12 @@ func startServer() {
 	}
 	defer ingester.Stop()
 
-	r := relay.New(database, ingester)
+	// Start vault watcher (loads configs from DB)
+	vaultWatcher := vault.New(database)
+	vaultWatcher.Start()
+	defer vaultWatcher.Stop()
+
+	r := relay.New(database, ingester, vaultWatcher)
 
 	addr := ":8090"
 	if v := os.Getenv("PORT"); v != "" {

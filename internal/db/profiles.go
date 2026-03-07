@@ -9,21 +9,24 @@ import (
 	"github.com/google/uuid"
 )
 
-const profileColumns = "id, slug, name, role, context_pack, soul_keys, skills, project, org_id, created_at, updated_at"
+const profileColumns = "id, slug, name, role, context_pack, soul_keys, skills, vault_paths, project, org_id, created_at, updated_at"
 
 func scanProfile(row interface{ Scan(...any) error }) (models.Profile, error) {
 	var p models.Profile
-	err := row.Scan(&p.ID, &p.Slug, &p.Name, &p.Role, &p.ContextPack, &p.SoulKeys, &p.Skills, &p.Project, &p.OrgID, &p.CreatedAt, &p.UpdatedAt)
+	err := row.Scan(&p.ID, &p.Slug, &p.Name, &p.Role, &p.ContextPack, &p.SoulKeys, &p.Skills, &p.VaultPaths, &p.Project, &p.OrgID, &p.CreatedAt, &p.UpdatedAt)
 	return p, err
 }
 
-func (d *DB) RegisterProfile(project, slug, name, role, contextPack, soulKeys, skills string) (*models.Profile, error) {
+func (d *DB) RegisterProfile(project, slug, name, role, contextPack, soulKeys, skills, vaultPaths string) (*models.Profile, error) {
 	now := time.Now().UTC().Format(memoryTimeFmt)
 	if soulKeys == "" {
 		soulKeys = "[]"
 	}
 	if skills == "" {
 		skills = "[]"
+	}
+	if vaultPaths == "" {
+		vaultPaths = "[]"
 	}
 
 	// Upsert: update if exists
@@ -41,13 +44,14 @@ func (d *DB) RegisterProfile(project, slug, name, role, contextPack, soulKeys, s
 			ContextPack: contextPack,
 			SoulKeys:    soulKeys,
 			Skills:      skills,
+			VaultPaths:  vaultPaths,
 			Project:     project,
 			CreatedAt:   now,
 			UpdatedAt:   now,
 		}
 		_, err := d.conn.Exec(
-			"INSERT INTO profiles (id, slug, name, role, context_pack, soul_keys, skills, project, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-			p.ID, p.Slug, p.Name, p.Role, p.ContextPack, p.SoulKeys, p.Skills, p.Project, p.CreatedAt, p.UpdatedAt,
+			"INSERT INTO profiles (id, slug, name, role, context_pack, soul_keys, skills, vault_paths, project, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			p.ID, p.Slug, p.Name, p.Role, p.ContextPack, p.SoulKeys, p.Skills, p.VaultPaths, p.Project, p.CreatedAt, p.UpdatedAt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("insert profile: %w", err)
@@ -60,8 +64,8 @@ func (d *DB) RegisterProfile(project, slug, name, role, contextPack, soulKeys, s
 
 	// Update existing
 	_, err = d.conn.Exec(
-		"UPDATE profiles SET name = ?, role = ?, context_pack = ?, soul_keys = ?, skills = ?, updated_at = ? WHERE slug = ? AND project = ?",
-		name, role, contextPack, soulKeys, skills, now, slug, project,
+		"UPDATE profiles SET name = ?, role = ?, context_pack = ?, soul_keys = ?, skills = ?, vault_paths = ?, updated_at = ? WHERE slug = ? AND project = ?",
+		name, role, contextPack, soulKeys, skills, vaultPaths, now, slug, project,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("update profile: %w", err)
@@ -71,6 +75,7 @@ func (d *DB) RegisterProfile(project, slug, name, role, contextPack, soulKeys, s
 	existing.ContextPack = contextPack
 	existing.SoulKeys = soulKeys
 	existing.Skills = skills
+	existing.VaultPaths = vaultPaths
 	existing.UpdatedAt = now
 	return &existing, nil
 }

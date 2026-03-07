@@ -9,6 +9,14 @@ import (
 	"github.com/google/uuid"
 )
 
+const boardColumns = "id, project, name, slug, description, created_by, created_at, archived_at"
+
+func scanBoard(row interface{ Scan(...any) error }) (models.Board, error) {
+	var b models.Board
+	err := row.Scan(&b.ID, &b.Project, &b.Name, &b.Slug, &b.Description, &b.CreatedBy, &b.CreatedAt, &b.ArchivedAt)
+	return b, err
+}
+
 func (d *DB) CreateBoard(project, name, slug, description, createdBy string) (*models.Board, error) {
 	now := time.Now().UTC().Format(memoryTimeFmt)
 	b := &models.Board{
@@ -33,7 +41,7 @@ func (d *DB) CreateBoard(project, name, slug, description, createdBy string) (*m
 
 func (d *DB) ListBoards(project string) ([]models.Board, error) {
 	rows, err := d.conn.Query(
-		`SELECT id, project, name, slug, description, created_by, created_at FROM boards WHERE project = ? ORDER BY created_at`,
+		`SELECT `+boardColumns+` FROM boards WHERE project = ? AND archived_at IS NULL ORDER BY created_at`,
 		project,
 	)
 	if err != nil {
@@ -43,8 +51,8 @@ func (d *DB) ListBoards(project string) ([]models.Board, error) {
 
 	var boards []models.Board
 	for rows.Next() {
-		var b models.Board
-		if err := rows.Scan(&b.ID, &b.Project, &b.Name, &b.Slug, &b.Description, &b.CreatedBy, &b.CreatedAt); err != nil {
+		b, err := scanBoard(rows)
+		if err != nil {
 			return nil, err
 		}
 		boards = append(boards, b)
@@ -54,7 +62,7 @@ func (d *DB) ListBoards(project string) ([]models.Board, error) {
 
 func (d *DB) ListAllBoards() ([]models.Board, error) {
 	rows, err := d.conn.Query(
-		`SELECT id, project, name, slug, description, created_by, created_at FROM boards ORDER BY project, created_at`,
+		`SELECT ` + boardColumns + ` FROM boards WHERE archived_at IS NULL ORDER BY project, created_at`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list all boards: %w", err)
@@ -63,8 +71,8 @@ func (d *DB) ListAllBoards() ([]models.Board, error) {
 
 	var boards []models.Board
 	for rows.Next() {
-		var b models.Board
-		if err := rows.Scan(&b.ID, &b.Project, &b.Name, &b.Slug, &b.Description, &b.CreatedBy, &b.CreatedAt); err != nil {
+		b, err := scanBoard(rows)
+		if err != nil {
 			return nil, err
 		}
 		boards = append(boards, b)
@@ -73,11 +81,10 @@ func (d *DB) ListAllBoards() ([]models.Board, error) {
 }
 
 func (d *DB) GetBoard(project, slug string) (*models.Board, error) {
-	var b models.Board
-	err := d.conn.QueryRow(
-		`SELECT id, project, name, slug, description, created_by, created_at FROM boards WHERE project = ? AND slug = ?`,
+	b, err := scanBoard(d.conn.QueryRow(
+		`SELECT `+boardColumns+` FROM boards WHERE project = ? AND slug = ?`,
 		project, slug,
-	).Scan(&b.ID, &b.Project, &b.Name, &b.Slug, &b.Description, &b.CreatedBy, &b.CreatedAt)
+	))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -85,4 +92,39 @@ func (d *DB) GetBoard(project, slug string) (*models.Board, error) {
 		return nil, fmt.Errorf("get board: %w", err)
 	}
 	return &b, nil
+}
+
+// ArchiveBoard soft-deletes a board and archives all its tasks.
+func (d *DB) ArchiveBoard(project, boardID string) error {
+	now := time.Now().UTC().Format(memoryTimeFmt)
+
+	_, err := d.conn.Exec(
+		`UPDATE boards SET archived_at = ? WHERE id = ? AND project = ? AND archived_at IS NULL`,
+		now, boardID, project,
+	)
+	if err != nil {
+		return fmt.Errorf("archive board: %w", err)
+	}
+
+	// Also archive all tasks on this board
+	_, err = d.conn.Exec(
+		`UPDATE tasks SET archived_at = ? WHERE board_id = ? AND project = ? AND archived_at IS NULL`,
+		now, boardID, project,
+	)
+	if err != nil {
+		return fmt.Errorf("archive board tasks: %w", err)
+	}
+	return nil
+}
+
+// DeleteBoard hard-deletes a board (only if already archived).
+func (d *DB) DeleteBoard(project, boardID string) error {
+	_, err := d.conn.Exec(
+		`DELETE FROM boards WHERE id = ? AND project = ? AND archived_at IS NOT NULL`,
+		boardID, project,
+	)
+	if err != nil {
+		return fmt.Errorf("delete board: %w", err)
+	}
+	return nil
 }

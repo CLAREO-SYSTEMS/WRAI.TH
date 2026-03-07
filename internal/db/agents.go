@@ -20,6 +20,9 @@ func scanAgent(row interface{ Scan(...any) error }) (models.Agent, error) {
 func (d *DB) RegisterAgent(project, name, role, description string, reportsTo, profileSlug *string, isExecutive bool, sessionID *string) (*models.Agent, bool, error) {
 	now := time.Now().UTC().Format(time.RFC3339)
 
+	// Ensure the project exists (auto-create with random planet on first use)
+	d.EnsureProject(project)
+
 	a, err := scanAgent(d.conn.QueryRow("SELECT "+agentColumns+" FROM agents WHERE name = ? AND project = ?", name, project))
 	if err == sql.ErrNoRows {
 		agent := &models.Agent{

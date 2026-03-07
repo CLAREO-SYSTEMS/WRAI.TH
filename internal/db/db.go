@@ -81,6 +81,32 @@ func NewReadOnly() (*DB, error) {
 	return &DB{conn: conn, path: dbPath}, nil
 }
 
+// ensureColumns checks a table for missing columns and adds them via ALTER TABLE.
+func ensureColumns(conn *sql.DB, table string, columns map[string]string) {
+	rows, err := conn.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	existing := make(map[string]bool)
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull int
+		var dflt sql.NullString
+		var pk int
+		rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk)
+		existing[name] = true
+	}
+
+	for col, def := range columns {
+		if !existing[col] {
+			conn.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, col, def))
+		}
+	}
+}
+
 func migrate(conn *sql.DB) error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS agents (
@@ -145,55 +171,66 @@ func migrate(conn *sql.DB) error {
 	);
 	`
 
-	// Add conversation_id column to messages if it doesn't exist (migration).
-	alterSchema := `
-	ALTER TABLE messages ADD COLUMN conversation_id TEXT;
-	`
-	alterIndex := `
-	CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
-	`
-
 	if _, err := conn.Exec(schema); err != nil {
 		return err
 	}
 
-	// ALTER TABLE may fail if column already exists — that's fine.
-	conn.Exec(alterSchema)
+	// --- Ensure all columns exist on every table (safe for old and new DBs) ---
 
-	if _, err := conn.Exec(alterIndex); err != nil {
-		return err
-	}
+	ensureColumns(conn, "agents", map[string]string{
+		"project":        "TEXT NOT NULL DEFAULT 'default'",
+		"reports_to":     "TEXT",
+		"profile_slug":   "TEXT",
+		"status":         "TEXT NOT NULL DEFAULT 'active'",
+		"deactivated_at": "TEXT",
+		"is_executive":   "INTEGER NOT NULL DEFAULT 0",
+		"session_id":     "TEXT",
+		"org_id":         "TEXT",
+	})
 
-	// Project isolation migration (idempotent — ALTER fails if column exists).
-	conn.Exec(`ALTER TABLE agents ADD COLUMN project TEXT NOT NULL DEFAULT 'default'`)
+	// Projects table (planet_type assigned per project)
+	conn.Exec(`CREATE TABLE IF NOT EXISTS projects (
+		name        TEXT PRIMARY KEY,
+		planet_type TEXT NOT NULL DEFAULT '',
+		created_at  TEXT NOT NULL DEFAULT ''
+	)`)
 
-	// Hierarchy migration (idempotent — ALTER fails if column exists).
-	conn.Exec(`ALTER TABLE agents ADD COLUMN reports_to TEXT`)
+	// Settings table (key-value, e.g. sun_type)
+	conn.Exec(`CREATE TABLE IF NOT EXISTS settings (
+		key   TEXT PRIMARY KEY,
+		value TEXT NOT NULL DEFAULT ''
+	)`)
 
-	// Agent extensions (idempotent).
-	conn.Exec(`ALTER TABLE agents ADD COLUMN profile_slug TEXT`)
-	conn.Exec(`ALTER TABLE agents ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`)
-	conn.Exec(`ALTER TABLE agents ADD COLUMN deactivated_at TEXT`)
-	conn.Exec(`ALTER TABLE agents ADD COLUMN is_executive INTEGER NOT NULL DEFAULT 0`)
-	conn.Exec(`ALTER TABLE agents ADD COLUMN session_id TEXT`)
-	conn.Exec(`ALTER TABLE messages ADD COLUMN project TEXT NOT NULL DEFAULT 'default'`)
-	conn.Exec(`ALTER TABLE conversations ADD COLUMN project TEXT NOT NULL DEFAULT 'default'`)
+	// Backfill projects from existing agents
+	backfillProjects(conn)
 
+	ensureColumns(conn, "messages", map[string]string{
+		"conversation_id": "TEXT",
+		"project":         "TEXT NOT NULL DEFAULT 'default'",
+		"task_id":         "TEXT",
+	})
+
+	ensureColumns(conn, "conversations", map[string]string{
+		"project": "TEXT NOT NULL DEFAULT 'default'",
+	})
+
+	// Indexes (all idempotent)
 	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_agents_project ON agents(project)`)
-	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_messages_project ON messages(project)`)
-	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project)`)
 	conn.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_project_name ON agents(project, name)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_messages_project ON messages(project)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_messages_task ON messages(task_id)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project)`)
 
-	// Remove the old global UNIQUE constraint on agents.name (existing DBs only).
-	// SQLite can't drop inline constraints, so we rebuild the table.
+	// Remove old global UNIQUE constraint on agents.name (existing DBs only).
 	migrateDropGlobalUnique(conn)
 
-	// Memory system tables
+	// Memory system
 	if err := migrateMemories(conn); err != nil {
 		return fmt.Errorf("migrate memories: %w", err)
 	}
 
-	// Phase 1: Per-agent read receipts
+	// Per-agent read receipts
 	conn.Exec(`CREATE TABLE IF NOT EXISTS message_reads (
 		message_id TEXT NOT NULL,
 		agent_name TEXT NOT NULL,
@@ -203,7 +240,7 @@ func migrate(conn *sql.DB) error {
 	)`)
 	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_message_reads_agent ON message_reads(agent_name, project)`)
 
-	// Phase 2: Profiles
+	// Profiles
 	conn.Exec(`CREATE TABLE IF NOT EXISTS profiles (
 		id           TEXT PRIMARY KEY,
 		slug         TEXT NOT NULL,
@@ -217,13 +254,12 @@ func migrate(conn *sql.DB) error {
 		updated_at   TEXT NOT NULL
 	)`)
 	conn.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_project_slug ON profiles(project, slug)`)
+	ensureColumns(conn, "profiles", map[string]string{
+		"skills":      "TEXT NOT NULL DEFAULT '[]'",
+		"vault_paths": "TEXT NOT NULL DEFAULT '[]'",
+	})
 
-	// Agent table migrations for profiles
-	conn.Exec(`ALTER TABLE agents ADD COLUMN profile_slug TEXT`)
-	conn.Exec(`ALTER TABLE agents ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`)
-	conn.Exec(`ALTER TABLE agents ADD COLUMN deactivated_at TEXT`)
-
-	// Phase 3: Tasks
+	// Tasks
 	conn.Exec(`CREATE TABLE IF NOT EXISTS tasks (
 		id              TEXT PRIMARY KEY,
 		profile_slug    TEXT NOT NULL,
@@ -245,27 +281,20 @@ func migrate(conn *sql.DB) error {
 	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project, status)`)
 	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_tasks_profile ON tasks(project, profile_slug)`)
 	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(project, priority, status)`)
-
-	// Message task_id FK
-	conn.Exec(`ALTER TABLE messages ADD COLUMN task_id TEXT`)
-	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_messages_task ON messages(task_id)`)
-
-	// Agent is_executive flag
-	conn.Exec(`ALTER TABLE agents ADD COLUMN is_executive BOOLEAN NOT NULL DEFAULT FALSE`)
-
-	// Phase 3: ACK timeout columns
-	conn.Exec(`ALTER TABLE tasks ADD COLUMN ack_notified_at TEXT`)
-	conn.Exec(`ALTER TABLE tasks ADD COLUMN ack_escalated_at TEXT`)
-
-	// Phase 4: parent_task_id (rename from reply_to_task)
-	conn.Exec(`ALTER TABLE tasks ADD COLUMN parent_task_id TEXT`)
-	// Migrate existing data from reply_to_task → parent_task_id
+	ensureColumns(conn, "tasks", map[string]string{
+		"ack_notified_at":  "TEXT",
+		"ack_escalated_at": "TEXT",
+		"parent_task_id":   "TEXT",
+		"board_id":         "TEXT",
+		"goal_id":          "TEXT",
+		"archived_at":      "TEXT",
+	})
+	// Migrate legacy reply_to_task -> parent_task_id
 	conn.Exec(`UPDATE tasks SET parent_task_id = reply_to_task WHERE reply_to_task IS NOT NULL AND parent_task_id IS NULL`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_tasks_board ON tasks(board_id)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_tasks_goal ON tasks(goal_id)`)
 
-	// Phase 5: Skills on profiles
-	conn.Exec(`ALTER TABLE profiles ADD COLUMN skills TEXT NOT NULL DEFAULT '[]'`)
-
-	// Phase 6: Teams + Orgs
+	// Teams + Orgs
 	conn.Exec(`CREATE TABLE IF NOT EXISTS orgs (
 		id          TEXT PRIMARY KEY,
 		name        TEXT NOT NULL,
@@ -313,10 +342,7 @@ func migrate(conn *sql.DB) error {
 		PRIMARY KEY (agent_name, project, target)
 	)`)
 
-	// Agent org_id for multi-org
-	conn.Exec(`ALTER TABLE agents ADD COLUMN org_id TEXT`)
-
-	// Boards per project
+	// Boards
 	conn.Exec(`CREATE TABLE IF NOT EXISTS boards (
 		id          TEXT PRIMARY KEY,
 		project     TEXT NOT NULL DEFAULT 'default',
@@ -327,10 +353,127 @@ func migrate(conn *sql.DB) error {
 		created_at  TEXT NOT NULL
 	)`)
 	conn.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_boards_project_slug ON boards(project, slug)`)
+	ensureColumns(conn, "boards", map[string]string{
+		"archived_at": "TEXT",
+	})
 
-	// Task board_id FK
-	conn.Exec(`ALTER TABLE tasks ADD COLUMN board_id TEXT`)
-	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_tasks_board ON tasks(board_id)`)
+	// Goals
+	conn.Exec(`CREATE TABLE IF NOT EXISTS goals (
+		id              TEXT PRIMARY KEY,
+		project         TEXT NOT NULL DEFAULT 'default',
+		type            TEXT NOT NULL DEFAULT 'agent_goal',
+		title           TEXT NOT NULL,
+		description     TEXT NOT NULL DEFAULT '',
+		owner_agent     TEXT,
+		parent_goal_id  TEXT,
+		status          TEXT NOT NULL DEFAULT 'active',
+		created_by      TEXT NOT NULL DEFAULT 'user',
+		created_at      TEXT NOT NULL,
+		updated_at      TEXT NOT NULL,
+		completed_at    TEXT
+	)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_goals_project_status ON goals(project, status)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_goals_parent ON goals(parent_goal_id)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_goals_type ON goals(project, type)`)
+
+	// Vaults (per-project config)
+	conn.Exec(`CREATE TABLE IF NOT EXISTS vaults (
+		project     TEXT PRIMARY KEY,
+		path        TEXT NOT NULL,
+		created_at  TEXT NOT NULL
+	)`)
+
+	// Vault docs
+	if err := migrateVault(conn); err != nil {
+		return fmt.Errorf("migrate vault: %w", err)
+	}
+
+	return nil
+}
+
+// backfillProjects creates project entries for any existing agents that don't have a project row yet.
+func backfillProjects(conn *sql.DB) {
+	planetPool := []string{
+		"barren/1", "barren/2", "barren/3", "barren/4",
+		"desert/1", "desert/2",
+		"forest/1", "forest/2",
+		"gas_giant/1", "gas_giant/2", "gas_giant/3", "gas_giant/4",
+		"ice/1",
+		"lava/1", "lava/2", "lava/3",
+		"ocean/1",
+		"terran/1", "terran/2",
+		"tundra/1", "tundra/2",
+	}
+
+	rows, err := conn.Query("SELECT DISTINCT project FROM agents WHERE project NOT IN (SELECT name FROM projects)")
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	var projects []string
+	for rows.Next() {
+		var p string
+		rows.Scan(&p)
+		projects = append(projects, p)
+	}
+
+	for _, p := range projects {
+		h := 0
+		for _, c := range p {
+			h = ((h << 5) - h + int(c))
+		}
+		if h < 0 {
+			h = -h
+		}
+		planet := planetPool[h%len(planetPool)]
+		conn.Exec("INSERT OR IGNORE INTO projects (name, planet_type, created_at) VALUES (?, ?, datetime('now'))", p, planet)
+	}
+}
+
+// migrateVault creates the vault_docs table, FTS5 virtual table, and sync triggers.
+func migrateVault(conn *sql.DB) error {
+	conn.Exec(`CREATE TABLE IF NOT EXISTS vault_docs (
+		path       TEXT NOT NULL,
+		project    TEXT NOT NULL,
+		title      TEXT NOT NULL DEFAULT '',
+		owner      TEXT NOT NULL DEFAULT '',
+		status     TEXT NOT NULL DEFAULT '',
+		tags       TEXT NOT NULL DEFAULT '[]',
+		content    TEXT NOT NULL DEFAULT '',
+		size_bytes INTEGER NOT NULL DEFAULT 0,
+		updated_at TEXT NOT NULL,
+		indexed_at TEXT NOT NULL,
+		PRIMARY KEY (path, project)
+	)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_vault_docs_project ON vault_docs(project)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_vault_docs_tags ON vault_docs(project, tags)`)
+
+	if _, err := conn.Exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vault_docs_fts USING fts5(
+		path, title, tags, content,
+		content=vault_docs,
+		content_rowid=rowid
+	)`); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: vault FTS5 not available: %v\n", err)
+		return nil
+	}
+
+	conn.Exec(`CREATE TRIGGER IF NOT EXISTS vault_docs_ai AFTER INSERT ON vault_docs BEGIN
+		INSERT INTO vault_docs_fts(rowid, path, title, tags, content)
+		VALUES (new.rowid, new.path, new.title, new.tags, new.content);
+	END`)
+
+	conn.Exec(`CREATE TRIGGER IF NOT EXISTS vault_docs_ad AFTER DELETE ON vault_docs BEGIN
+		INSERT INTO vault_docs_fts(vault_docs_fts, rowid, path, title, tags, content)
+		VALUES ('delete', old.rowid, old.path, old.title, old.tags, old.content);
+	END`)
+
+	conn.Exec(`CREATE TRIGGER IF NOT EXISTS vault_docs_au AFTER UPDATE ON vault_docs BEGIN
+		INSERT INTO vault_docs_fts(vault_docs_fts, rowid, path, title, tags, content)
+		VALUES ('delete', old.rowid, old.path, old.title, old.tags, old.content);
+		INSERT INTO vault_docs_fts(rowid, path, title, tags, content)
+		VALUES (new.rowid, new.path, new.title, new.tags, new.content);
+	END`)
 
 	return nil
 }
@@ -338,9 +481,10 @@ func migrate(conn *sql.DB) error {
 // migrateDropGlobalUnique removes the old UNIQUE constraint on agents.name
 // that was created in early versions. Only runs if the constraint still exists.
 func migrateDropGlobalUnique(conn *sql.DB) {
-	// Check if the old sqlite_autoindex for UNIQUE(name) exists.
+	// Check if the old UNIQUE(name) autoindex exists (sqlite_autoindex_agents_2).
+	// Note: sqlite_autoindex_agents_1 is the PRIMARY KEY, not the UNIQUE(name).
 	var count int
-	err := conn.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='sqlite_autoindex_agents_1'`).Scan(&count)
+	err := conn.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='sqlite_autoindex_agents_2'`).Scan(&count)
 	if err != nil || count == 0 {
 		return // no old constraint, nothing to do
 	}

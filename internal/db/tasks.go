@@ -10,25 +10,28 @@ import (
 )
 
 // Valid task state transitions
+// "done" and "cancelled" are reachable from any state (flexible cleanup)
 var validTransitions = map[string][]string{
-	"pending":     {"accepted", "in-progress"},
-	"accepted":    {"in-progress"},
-	"in-progress": {"done", "blocked"},
-	"blocked":     {"in-progress"},
+	"pending":     {"accepted", "in-progress", "done", "cancelled"},
+	"accepted":    {"in-progress", "done", "cancelled"},
+	"in-progress": {"done", "blocked", "cancelled"},
+	"blocked":     {"in-progress", "done", "cancelled"},
+	"done":        {"cancelled"},
+	"cancelled":   {},
 }
 
-const taskColumns = "id, profile_slug, assigned_to, dispatched_by, title, description, priority, status, result, blocked_reason, project, dispatched_at, accepted_at, started_at, completed_at, parent_task_id, ack_notified_at, ack_escalated_at, board_id"
+const taskColumns = "id, profile_slug, assigned_to, dispatched_by, title, description, priority, status, result, blocked_reason, project, dispatched_at, accepted_at, started_at, completed_at, parent_task_id, ack_notified_at, ack_escalated_at, board_id, goal_id, archived_at"
 
 func scanTask(row interface{ Scan(...any) error }) (models.Task, error) {
 	var t models.Task
 	err := row.Scan(&t.ID, &t.ProfileSlug, &t.AssignedTo, &t.DispatchedBy, &t.Title, &t.Description,
 		&t.Priority, &t.Status, &t.Result, &t.BlockedReason, &t.Project,
 		&t.DispatchedAt, &t.AcceptedAt, &t.StartedAt, &t.CompletedAt, &t.ParentTaskID,
-		&t.AckNotifiedAt, &t.AckEscalatedAt, &t.BoardID)
+		&t.AckNotifiedAt, &t.AckEscalatedAt, &t.BoardID, &t.GoalID, &t.ArchivedAt)
 	return t, err
 }
 
-func (d *DB) DispatchTask(project, profileSlug, dispatchedBy, title, description, priority string, parentTaskID, boardID *string) (*models.Task, error) {
+func (d *DB) DispatchTask(project, profileSlug, dispatchedBy, title, description, priority string, parentTaskID, boardID, goalID *string) (*models.Task, error) {
 	now := time.Now().UTC().Format(memoryTimeFmt)
 	if priority == "" {
 		priority = "P2"
@@ -46,13 +49,14 @@ func (d *DB) DispatchTask(project, profileSlug, dispatchedBy, title, description
 		DispatchedAt: now,
 		ParentTaskID: parentTaskID,
 		BoardID:      boardID,
+		GoalID:       goalID,
 	}
 
 	_, err := d.conn.Exec(
-		`INSERT INTO tasks (id, profile_slug, dispatched_by, title, description, priority, status, project, dispatched_at, parent_task_id, board_id)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tasks (id, profile_slug, dispatched_by, title, description, priority, status, project, dispatched_at, parent_task_id, board_id, goal_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		task.ID, task.ProfileSlug, task.DispatchedBy, task.Title, task.Description,
-		task.Priority, task.Status, task.Project, task.DispatchedAt, task.ParentTaskID, task.BoardID,
+		task.Priority, task.Status, task.Project, task.DispatchedAt, task.ParentTaskID, task.BoardID, task.GoalID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("dispatch task: %w", err)
@@ -78,6 +82,10 @@ func (d *DB) CompleteTask(taskID, agentName, project string, result *string) (*m
 
 func (d *DB) BlockTask(taskID, agentName, project string, reason *string) (*models.Task, error) {
 	return d.transitionTask(taskID, agentName, project, "blocked", nil, reason)
+}
+
+func (d *DB) CancelTask(taskID, agentName, project string, reason *string) (*models.Task, error) {
+	return d.transitionTask(taskID, agentName, project, "cancelled", nil, reason)
 }
 
 func (d *DB) transitionTask(taskID, agentName, project, newStatus string, result, blockedReason *string) (*models.Task, error) {
@@ -146,6 +154,13 @@ func (d *DB) transitionTask(taskID, agentName, project, newStatus string, result
 		_, err = d.conn.Exec(
 			"UPDATE tasks SET status = ?, blocked_reason = ? WHERE id = ? AND project = ?",
 			newStatus, blockedReason, taskID, project,
+		)
+	case "cancelled":
+		task.CompletedAt = &now
+		task.BlockedReason = blockedReason // reuse as cancellation reason
+		_, err = d.conn.Exec(
+			"UPDATE tasks SET status = ?, blocked_reason = ?, completed_at = ? WHERE id = ? AND project = ?",
+			newStatus, blockedReason, now, taskID, project,
 		)
 	}
 	if err != nil {
@@ -326,7 +341,7 @@ func (d *DB) ListTasks(project, status, profileSlug, priority, assignedTo, board
 		limit = 50
 	}
 
-	query := "SELECT " + taskColumns + " FROM tasks WHERE project = ?"
+	query := "SELECT " + taskColumns + " FROM tasks WHERE project = ? AND archived_at IS NULL"
 	args := []any{project}
 
 	if status != "" {
@@ -375,7 +390,7 @@ func (d *DB) ListAllTasks(limit int) ([]models.Task, error) {
 		limit = 100
 	}
 	rows, err := d.conn.Query(
-		"SELECT "+taskColumns+" FROM tasks ORDER BY CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 WHEN 'P3' THEN 3 END, dispatched_at DESC LIMIT ?",
+		"SELECT "+taskColumns+" FROM tasks WHERE archived_at IS NULL ORDER BY CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 WHEN 'P3' THEN 3 END, dispatched_at DESC LIMIT ?",
 		limit,
 	)
 	if err != nil {
@@ -431,11 +446,42 @@ func (d *DB) DeleteTask(taskID, project string) error {
 	return nil
 }
 
+// FindSimilarTasks checks for existing non-done/cancelled tasks with a similar title under the same profile.
+func (d *DB) FindSimilarTasks(project, profileSlug, title string) ([]models.Task, error) {
+	// Use LIKE with the first 20 chars of the title for a rough match
+	search := title
+	if len(search) > 20 {
+		search = search[:20]
+	}
+	return d.queryTasks(
+		"SELECT "+taskColumns+" FROM tasks WHERE project = ? AND profile_slug = ? AND status NOT IN ('done','cancelled') AND title LIKE ? LIMIT 5",
+		project, profileSlug, "%"+search+"%",
+	)
+}
+
+// CheckSubtasksComplete checks if all subtasks of a parent task are done or cancelled.
+// Returns (allComplete, total, doneCount).
+func (d *DB) CheckSubtasksComplete(parentTaskID, project string) (bool, int, int) {
+	var total, doneCount int
+	_ = d.conn.QueryRow(
+		"SELECT COUNT(*) FROM tasks WHERE parent_task_id = ? AND project = ?",
+		parentTaskID, project,
+	).Scan(&total)
+	if total == 0 {
+		return false, 0, 0
+	}
+	_ = d.conn.QueryRow(
+		"SELECT COUNT(*) FROM tasks WHERE parent_task_id = ? AND project = ? AND status IN ('done','cancelled')",
+		parentTaskID, project,
+	).Scan(&doneCount)
+	return doneCount >= total, total, doneCount
+}
+
 func (d *DB) GetTasksSince(project, since string, limit int) ([]models.Task, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	query := "SELECT " + taskColumns + " FROM tasks WHERE (dispatched_at > ? OR accepted_at > ? OR started_at > ? OR completed_at > ?)"
+	query := "SELECT " + taskColumns + " FROM tasks WHERE archived_at IS NULL AND (dispatched_at > ? OR accepted_at > ? OR started_at > ? OR completed_at > ?)"
 	args := []any{since, since, since, since}
 	if project != "" {
 		query += " AND project = ?"
@@ -459,4 +505,31 @@ func (d *DB) GetTasksSince(project, since string, limit int) ([]models.Task, err
 		tasks = append(tasks, t)
 	}
 	return tasks, rows.Err()
+}
+
+// ArchiveTasks soft-deletes tasks matching the given filters.
+// status: "done", "cancelled", or "" for both done+cancelled. boardID: filter by board, or "" for all.
+func (d *DB) ArchiveTasks(project, status, boardID string) (int64, error) {
+	now := time.Now().UTC().Format(memoryTimeFmt)
+
+	query := "UPDATE tasks SET archived_at = ? WHERE project = ? AND archived_at IS NULL"
+	args := []any{now, project}
+
+	if status != "" {
+		query += " AND status = ?"
+		args = append(args, status)
+	} else {
+		query += " AND status IN ('done', 'cancelled')"
+	}
+
+	if boardID != "" {
+		query += " AND board_id = ?"
+		args = append(args, boardID)
+	}
+
+	result, err := d.conn.Exec(query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("archive tasks: %w", err)
+	}
+	return result.RowsAffected()
 }
