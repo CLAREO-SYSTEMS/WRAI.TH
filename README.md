@@ -10,7 +10,7 @@ Each project is a planet. Each agent is a robot on its surface. You get a manage
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
 [![Binary](https://img.shields.io/badge/Binary-~8MB-3fb950?style=flat-square)]()
 
-[Quick Start](#quick-start) · [The Galaxy](#the-galaxy) · [The Colony](#the-colony) · [The Cinema](#the-cinema) · [MCP Tools](#mcp-tools) · [Architecture](#architecture)
+[Quick Start](#quick-start) · [The Galaxy](#the-galaxy) · [The Colony](#the-colony) · [MCP Tools](#mcp-tools) · [Architecture](#architecture)
 
 </div>
 
@@ -133,71 +133,6 @@ Three tabs, always one keypress away:
 **Memories** `[Y]` — The team's collective knowledge. Key-value pairs scoped to agent, project, or global. When two agents write conflicting values for the same key, the conflict surfaces and can be resolved. Knowledge survives `/clear`, context resets, and session restarts. This is how agents remember.
 
 **Tasks** `[T]` — Every task in the project. Filter by status, priority, or "My Tasks" to see only what's assigned to you. The goal cascade runs underneath: mission -> objectives -> key results -> tasks. Progress rolls up automatically.
-
----
-
-## The Cinema
-
-Here's the part I'm most proud of.
-
-The galaxy background isn't a static skybox. It's a narrative engine. A Spielberg-inspired phase system cycles through moods:
-
-**calm** — a few shooting stars, maybe a station drifting by. The space breathes.
-
-**building** — meteor showers, comets streaking, asteroids tumbling. Something's gathering.
-
-**climax** — a scene plays. Choreographed, multi-beat, using the full pixel art asset library.
-
-**cooldown** — the dust settles. Back to calm.
-
-21 scenes, and no two play the same way:
-
-A **star dies** — it agitates, shooting stars converge on it from three directions, then a supernova detonates and blasts debris outward, pushing nearby asteroids away from the shockwave.
-
-A **wormhole opens** — a foreshadow glow pulses, space dust swirls toward the point, spiral arms spin up, and a ship bursts through from the other side, engines trailing blue.
-
-A **dogfight** breaks out — a blue ship streaks across the screen, a red one chasing close behind. A flash — laser hit. The blue ship jerks sideways in evasion. Debris tumbles from the impact point.
-
-A **dyson sphere** gets built — a sun appears, two ships arrive from opposite sides, and frame by frame, a megastructure assembles around the star.
-
-A **black hole** spawns — accretion disk glowing purple, gravity tendrils reaching outward. Nearby asteroids start drifting toward it, accelerating, spiraling in.
-
-Two **galaxies collide** — drifting toward each other across the screen, merging in a supernova flash, starburst radiating outward from the impact.
-
-A ship pauses mid-screen and tells you a **programming joke** in a speech bubble. Then flies away.
-
-And sometimes — a **false calm**. A foreshadow glow, dust pulling toward a point... and then nothing happens. The tension was the scene.
-
-Every scene uses canvas-relative coordinates — they work on any screen size, any aspect ratio. The ships come from different directions each time. The positions are randomized. You can watch for hours and never see the same moment twice.
-
-<details>
-<summary><b>All 21 scenes</b></summary>
-
-| Scene | What happens |
-|---|---|
-| Stellar Death | Star agitates, shooting stars converge, supernova detonates, debris blast |
-| Wormhole Transit | Foreshadow, dust spirals in, wormhole opens, ship emerges |
-| Comet Breakup | Comet streaks across, shatters, asteroid fragments fan out |
-| Patrol | Nav light, lead ship, then two wingmen in formation |
-| Dogfight | Blue ship chased by red, laser flash, evasive maneuver, debris |
-| Hyperspace Jump | Ship cruises, decelerates, stretches into light, vanishes |
-| Pulsar Discovery | Flash, hyperspace burst, rotating beam illuminates nearby dust |
-| Station Resupply | Station drifts in, ship approaches, docks alongside, departs |
-| Deep Space Signal | Quasar pulses, radial shooting stars in two waves |
-| Ship Joke | Ship hovers, speech bubble with a joke, flies off |
-| Convoy | Three ships in formation, staggered entry |
-| Distant Battle | Tiny flashes far away, debris drifts |
-| False Calm | Foreshadow glow, dust pull... then nothing |
-| Blackhole Capture | Black hole with accretion disk, asteroids spiral in |
-| Nebula Storm | Nebula flares, shooting stars burst outward in waves |
-| Dyson Construction | Sun, arriving ships, dyson frames progressively overlay |
-| Moon Capture | Drifting moon gets gravitationally captured into elliptical orbit |
-| Galaxy Collision | Two galaxies merge, supernova flash, starburst |
-| Ring Formation | Asteroid breakup, debris expands, ring structure coalesces |
-| Asteroid Belt Crossing | Dense belt, ship weaves through, close-call asteroids |
-| Starfield Anomaly | Stars agitate, hyperspace flash, pulsing anomaly appears |
-
-</details>
 
 ---
 
@@ -487,20 +422,6 @@ wrai.th ingests Claude Code hook events to show real-time agent activity on the 
 ```
 
 Each tool call maps to an activity state — `terminal`, `browser`, `read`, `write`, `thinking`, `waiting` — shown as a live indicator on the robot sprite.
-
----
-
-## Keyboard shortcuts
-
-| Key | Action |
-|---|---|
-| `1` `2` `3` | Canvas, Kanban, Vault |
-| `M` `Y` `T` | Messages, Memories, Tasks |
-| `N` | New task (Kanban) |
-| `/` | Focus search |
-| `?` | Toggle help |
-| `Esc` | Close panel / back to Galaxy |
-| `+` `-` | Font scale |
 
 ---
 
