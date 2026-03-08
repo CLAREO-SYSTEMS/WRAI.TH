@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WRAI.TH Mission Control</title>
+    <link rel="stylesheet" href="/css/mission-control.css">
+</head>
+<body>
+    <header id="header">
+        <h1>WRAI.TH <span class="accent">MISSION CONTROL</span></h1>
+        <div id="status-bar">
+            <span id="relay-status" class="status-dot offline">RELAY</span>
+            <span id="ws-status" class="status-dot offline">WS</span>
+            <span id="machine-name"></span>
+        </div>
+    </header>
+
+    <section id="fleet-overview">
+        <h2>FLEET</h2>
+        <div id="fleet-grid"></div>
+    </section>
+
+    <section id="agent-panel" class="hidden">
+        <div id="tab-bar"></div>
+        <div id="agent-view">
+            <div id="agent-header">
+                <span id="agent-name"></span>
+                <span id="agent-state" class="state-badge"></span>
+                <span id="agent-pid"></span>
+                <span id="agent-uptime"></span>
+                <span id="agent-tokens"></span>
+                <div id="agent-controls">
+                    <button onclick="agentAction('start')" class="btn">START</button>
+                    <button onclick="agentAction('stop')" class="btn btn-danger">STOP</button>
+                    <button onclick="agentAction('wake')" class="btn btn-accent">WAKE</button>
+                </div>
+            </div>
+            <div id="agent-content">
+                <div id="messages-panel">
+                    <h3>MESSAGES</h3>
+                    <div id="messages-list"></div>
+                </div>
+                <div id="stdout-panel">
+                    <h3>LIVE OUTPUT</h3>
+                    <div id="stdout-output"></div>
+                </div>
+            </div>
+            <div id="send-bar">
+                <input type="text" id="send-input" placeholder="Send message through this agent..." />
+                <button onclick="sendMessage()" class="btn btn-accent">SEND</button>
+            </div>
+        </div>
+    </section>
+
+    <script type="module" src="/js/app.js"></script>
+</body>
+</html>

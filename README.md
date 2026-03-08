@@ -837,10 +837,104 @@ CGO_ENABLED=1 go build -tags fts5 -o agent-relay .
 
 ---
 
+## WRAI.TH Client — Session Controller & Discord Bridge
+
+> **CLAREO-SYSTEMS fork extension** — the `client/` directory is specific to this fork.
+
+The `client/` directory contains a **Python companion** that turns the relay into a fully autonomous agent operations platform. The relay handles coordination (MCP, messaging, memory, tasks). The client handles **lifecycle** — spawning Claude Code sessions, routing Discord messages, monitoring token spend, and exposing a Mission Control web UI.
+
+Zero LLM tokens for routing. The client is pure Python async — it forwards, monitors, and reacts. Claude only runs when there's real work.
+
+### Two deployment modes
+
+```
+┌─ Station (your main machine) ──────────────────────┐
+│  relay (Go binary)                                  │
+│  client:                                            │
+│    ├─ SSE listener ← relay activity stream          │
+│    ├─ Session controller → spawn/wake Claude Code   │
+│    ├─ Discord bridge ↔ human-agent communication    │
+│    ├─ Mission Control UI (FastAPI + WebSocket)      │
+│    └─ Token monitor → SQLite usage tracking         │
+└─────────────────────────────────────────────────────┘
+
+┌─ Satellite (remote machines) ──────────────────────┐
+│  client (connects to station relay):                │
+│    ├─ SSE listener ← remote relay stream            │
+│    ├─ Session controller → local Claude sessions    │
+│    ├─ Stdout API → streams output to station UI     │
+│    └─ Token monitor → local usage tracking          │
+└─────────────────────────────────────────────────────┘
+```
+
+**Station** runs the relay + full client (Discord, web UI, all agents on this machine).
+**Satellite** runs the client only, connecting to a remote station's relay. Agents run locally but appear in the station's Mission Control.
+
+### Setup
+
+```bash
+cd client
+cp config.example.yaml config.yaml   # Edit with your settings
+cp .env.example .env                  # Add DISCORD_TOKEN
+pip install -e .                      # Or: pip install -e ".[dev]"
+python -m src.main                    # Boots based on config mode
+```
+
+### What each component does
+
+| Component | Role | Tokens? |
+|---|---|---|
+| **SSE Listener** | One persistent connection to `/api/activity/stream`. Detects new messages, agent status changes, task dispatches. | No |
+| **Session Controller** | Spawns interactive Claude Code processes. Keeps them alive. Pipes `/relay talk` to wake sleeping agents. Auto-restarts crashed sessions (max 5 retries with backoff). | No |
+| **Discord Bridge** | Routes messages between Discord channels and the relay. Pool-based channels (#quant-pool, #dev-pool, #ops-pool). Handles `/agentname message` commands and @mentions. Onboards unknown users via CTO notification. | No |
+| **Mission Control** | FastAPI web UI at `http://localhost:8400`. Fleet overview, per-agent stdout streaming via WebSocket, start/stop/wake controls, message sending. | No |
+| **Token Monitor** | Parses token counts from Claude stdout. SQLite-backed daily tracking per agent. Configurable daily limits with warnings. | No |
+
+### Config
+
+```yaml
+mode: station          # or "satellite"
+machine:
+  name: zeus
+relay:
+  url: http://localhost:8090
+  project: my-project
+web:
+  port: 8400
+discord:
+  enabled: true
+  token: ${DISCORD_TOKEN}
+  channels:
+    quant-pool: "123456789"
+    dev-pool: "987654321"
+agents:
+  backend-dev:
+    machine: zeus
+    work_dir: /path/to/project
+    profile_slug: backend-dev
+    pool: dev-pool
+```
+
+See [`client/config.example.yaml`](client/config.example.yaml) for the full schema and [`client/PLAN.md`](client/PLAN.md) for the architecture document.
+
+### Client stack
+
+Python 3.11+, FastAPI, httpx, discord.py, structlog, aiosqlite
+
+```bash
+git clone https://github.com/CLAREO-SYSTEMS/WRAI.TH
+cd WRAI.TH
+go run . serve              # Start the relay
+cd client && pip install -e . && python -m src.main  # Start the client
+# Relay UI: http://localhost:8090 | Mission Control: http://localhost:8400
+```
+
+<br>
+
+---
+
 <div align="center">
 
-Built at [synergix-lab](https://github.com/synergix-lab) · MIT License
-
-<!-- [![Star History Chart](https://api.star-history.com/svg?repos=synergix-lab/agent-relay&type=Date)](https://star-history.com/#synergix-lab/agent-relay&Date) -->
+Fork maintained by [CLAREO-SYSTEMS](https://github.com/CLAREO-SYSTEMS) · Original by [synergix-lab](https://github.com/synergix-lab) · MIT License
 
 </div>

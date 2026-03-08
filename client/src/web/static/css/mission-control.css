@@ -1,0 +1,332 @@
+/* WRAI.TH Mission Control — retro/pixel-art aesthetic */
+
+:root {
+    --bg: #0a0a1a;
+    --bg-panel: #111128;
+    --bg-card: #1a1a3a;
+    --text: #c8c8e8;
+    --text-dim: #6868a8;
+    --accent: #00ffaa;
+    --accent2: #ff6b9d;
+    --danger: #ff4444;
+    --warning: #ffaa00;
+    --success: #00ff88;
+    --border: #2a2a5a;
+    --font: "Courier New", "Consolas", monospace;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 13px;
+    min-height: 100vh;
+}
+
+/* ── Header ─────────────────────────────────────────── */
+
+#header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-panel);
+}
+
+#header h1 {
+    font-size: 16px;
+    letter-spacing: 2px;
+    color: var(--text-dim);
+}
+
+.accent {
+    color: var(--accent);
+}
+
+#status-bar {
+    display: flex;
+    gap: 16px;
+    align-items: center;
+    font-size: 11px;
+}
+
+.status-dot {
+    padding: 2px 8px;
+    border-radius: 2px;
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 1px;
+}
+
+.status-dot.online {
+    background: rgba(0, 255, 136, 0.15);
+    color: var(--success);
+    border: 1px solid rgba(0, 255, 136, 0.3);
+}
+
+.status-dot.offline {
+    background: rgba(255, 68, 68, 0.15);
+    color: var(--danger);
+    border: 1px solid rgba(255, 68, 68, 0.3);
+}
+
+/* ── Fleet Overview ─────────────────────────────────── */
+
+#fleet-overview {
+    padding: 16px 20px;
+}
+
+#fleet-overview h2 {
+    font-size: 12px;
+    color: var(--text-dim);
+    letter-spacing: 2px;
+    margin-bottom: 12px;
+}
+
+#fleet-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.fleet-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    padding: 10px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    min-width: 140px;
+    transition: border-color 0.2s;
+}
+
+.fleet-card:hover {
+    border-color: var(--accent);
+}
+
+.fleet-card .agent-name {
+    font-weight: bold;
+    margin-bottom: 4px;
+}
+
+.fleet-card .agent-status {
+    font-size: 11px;
+    color: var(--text-dim);
+}
+
+.fleet-card[data-state="working"] .state-indicator { color: var(--success); }
+.fleet-card[data-state="idle"] .state-indicator { color: var(--text-dim); }
+.fleet-card[data-state="spawning"] .state-indicator { color: var(--warning); }
+.fleet-card[data-state="sleeping"] .state-indicator { color: var(--accent2); }
+.fleet-card[data-state="crashed"] .state-indicator { color: var(--danger); }
+.fleet-card[data-state="dead"] .state-indicator { color: var(--danger); }
+
+.machine-label {
+    font-size: 10px;
+    color: var(--text-dim);
+    letter-spacing: 1px;
+    margin-bottom: 6px;
+    padding: 2px 0;
+    border-bottom: 1px solid var(--border);
+}
+
+/* ── Agent Panel ────────────────────────────────────── */
+
+#agent-panel {
+    padding: 0 20px 20px;
+}
+
+.hidden {
+    display: none !important;
+}
+
+#tab-bar {
+    display: flex;
+    gap: 2px;
+    margin-bottom: 12px;
+}
+
+.tab {
+    padding: 6px 14px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-bottom: none;
+    border-radius: 4px 4px 0 0;
+    cursor: pointer;
+    font-size: 11px;
+    color: var(--text-dim);
+    letter-spacing: 1px;
+}
+
+.tab.active {
+    background: var(--bg-panel);
+    color: var(--accent);
+    border-color: var(--accent);
+}
+
+#agent-header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 10px 14px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    margin-bottom: 12px;
+}
+
+#agent-name {
+    font-weight: bold;
+    font-size: 14px;
+}
+
+.state-badge {
+    padding: 2px 8px;
+    border-radius: 2px;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+#agent-controls {
+    margin-left: auto;
+    display: flex;
+    gap: 6px;
+}
+
+.btn {
+    padding: 4px 12px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 11px;
+    cursor: pointer;
+    border-radius: 2px;
+    letter-spacing: 1px;
+}
+
+.btn:hover {
+    border-color: var(--accent);
+}
+
+.btn-accent {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.btn-danger {
+    border-color: var(--danger);
+    color: var(--danger);
+}
+
+/* ── Content Panels ─────────────────────────────────── */
+
+#agent-content {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    height: 60vh;
+}
+
+#messages-panel,
+#stdout-panel {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+#messages-panel h3,
+#stdout-panel h3 {
+    font-size: 10px;
+    color: var(--text-dim);
+    letter-spacing: 2px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+}
+
+#messages-list,
+#stdout-output {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 12px;
+    font-size: 12px;
+    line-height: 1.6;
+}
+
+#stdout-output {
+    font-size: 11px;
+    color: var(--accent);
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+.msg-item {
+    padding: 6px 0;
+    border-bottom: 1px solid rgba(42, 42, 90, 0.5);
+}
+
+.msg-item .msg-header {
+    font-size: 10px;
+    color: var(--text-dim);
+    margin-bottom: 2px;
+}
+
+.msg-item .msg-content {
+    color: var(--text);
+}
+
+.msg-from { color: var(--accent2); }
+.msg-to { color: var(--accent); }
+
+/* ── Send Bar ───────────────────────────────────────── */
+
+#send-bar {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+#send-input {
+    flex: 1;
+    padding: 8px 12px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 12px;
+    border-radius: 2px;
+}
+
+#send-input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+/* ── Scrollbar ──────────────────────────────────────── */
+
+::-webkit-scrollbar {
+    width: 6px;
+}
+
+::-webkit-scrollbar-track {
+    background: var(--bg);
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--text-dim);
+}
