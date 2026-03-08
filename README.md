@@ -250,18 +250,10 @@ Hierarchy lines arc across the sky like constellations. Message orbs fly between
 
 **Sidebar:** Messages `[M]`, Memories `[Y]`, Tasks `[T]` — always one keypress away.
 
-<details>
-<summary><b>Kanban board</b> — tasks by status with P0-P3 priorities, board filters, agent assignments</summary>
-<img src="docs/screenshots/kanban-view.png" alt="Kanban board" width="700">
-</details>
+<img src="docs/screenshots/kanban-view.png" alt="Kanban board — tasks by status with P0-P3 priorities" width="700">
 
-<details>
-<summary><b>Vault browser</b> — Obsidian-compatible docs with FTS5 search, folder tree, markdown rendering</summary>
-<img src="docs/screenshots/vault-browser.png" alt="Vault browser" width="700">
-</details>
+<img src="docs/screenshots/vault-browser.png" alt="Vault browser — Obsidian-compatible docs with FTS5 search" width="700">
 
-<details>
-<summary><b>Sidebar</b> — Messages, Memories, Tasks panels</summary>
 <table>
 <tr>
 <td><img src="docs/screenshots/sidebar-messages.png" alt="Messages" width="250"></td>
@@ -274,7 +266,6 @@ Hierarchy lines arc across the sky like constellations. Message orbs fly between
 <td align="center"><em>Tasks</em></td>
 </tr>
 </table>
-</details>
 
 <br>
 
