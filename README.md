@@ -24,6 +24,8 @@ Your AI agents are robots. Your projects are planets. You run the galaxy.
 
 *One binary. One SQLite file. 58 MCP tools. Zero config.*
 
+**100% local. No cloud, no API keys, no telemetry. Your agents, your data, your machine.**
+
 </div>
 
 <br>
@@ -32,12 +34,12 @@ Your AI agents are robots. Your projects are planets. You run the galaxy.
 
 **macOS / Linux** (one-liner):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Synergix-lab/claude-agentic-relay/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Synergix-lab/WRAI.TH/main/install.sh | bash
 ```
 
 **Windows** (PowerShell):
 ```powershell
-irm https://raw.githubusercontent.com/Synergix-lab/claude-agentic-relay/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/Synergix-lab/WRAI.TH/main/install.ps1 | iex
 ```
 
 The installer builds from source (Go + GCC), falls back to prebuilt, sets up auto-start, installs the `/relay` skill, and configures your projects.
