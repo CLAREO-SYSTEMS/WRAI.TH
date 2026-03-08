@@ -20,8 +20,8 @@ Your AI agents are robots. Your projects are planets. You run the galaxy.
 
 <br>
 
-<!-- HERO SCREENSHOT: Replace with actual screenshot -->
-<!-- <img src="docs/assets/galaxy-screenshot.png" alt="Galaxy View" width="800"> -->
+<img src="docs/screenshots/galaxy-view.png" alt="Galaxy View — projects orbit as pixel-art planets" width="800">
+
 *One binary. One SQLite file. 58 MCP tools. Zero config.*
 
 </div>
@@ -199,7 +199,7 @@ When teams are configured, messaging follows boundaries:
 
 ```json
 {
-  "profile": { "slug": "backend", "skills": [...], "soul_keys": [...] },
+  "profile": { "slug": "backend", "skills": [...] },
   "pending_tasks": { "assigned_to_me": [...], "dispatched_by_me": [...] },
   "goal_context": { "<goal-id>": [mission, project_goal, agent_goal] },
   "unread_messages": [...],
@@ -217,7 +217,7 @@ Profile, tasks with goal ancestry, unread inbox, active conversations, relevant 
 
 Open `http://localhost:8090`. Each project is a planet — spinning pixel art drawn from 9 animated biomes.
 
-<!-- <img src="docs/assets/galaxy-view.png" alt="Galaxy View" width="700"> -->
+<img src="docs/screenshots/galaxy-view.png" alt="Galaxy View — projects orbit as pixel-art planets" width="700">
 
 | Feature | Detail |
 |---|---|
@@ -233,7 +233,7 @@ Click a planet. The camera zooms through space, the planet grows, and you land o
 
 ## &#x1F916; The Colony
 
-<!-- <img src="docs/assets/colony-view.png" alt="Colony View" width="700"> -->
+<img src="docs/screenshots/colony-view.png" alt="Colony View — robots, hierarchy lines, objectives, user questions" width="700">
 
 Your agents are pixel art robots — 6 archetypes (astronaut, hacker, droid, cyborg, captain, wraith) assigned by name hash. Your `backend` always looks the same. Your `cto` might get the rare golden variant (1/1000).
 
@@ -293,7 +293,7 @@ list_vault_docs({ tags: '["decisions"]' })               # browse by tag
 ```
 register_profile({
   slug: "backend",
-  vault_paths: '["team/souls/backend.md", "guides/api-*.md"]'
+  vault_paths: '["team/docs/backend.md", "guides/api-*.md"]'
 })
 ```
 
@@ -546,11 +546,11 @@ mission
 <details>
 <summary><strong>Profiles</strong> — 4 tools</summary>
 
-Reusable role definitions — soul, skills, working style, auto-injected vault docs.
+Reusable role definitions — skills, working style, auto-injected vault docs.
 
 | Tool | What it does |
 |---|---|
-| `register_profile` | Define archetype with skills, soul keys, vault patterns |
+| `register_profile` | Define archetype with skills, context keys, vault patterns |
 | `get_profile` / `list_profiles` | Retrieve profiles |
 | `find_profiles` | Search by skill tag |
 
