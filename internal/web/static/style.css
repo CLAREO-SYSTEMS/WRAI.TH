@@ -39,6 +39,13 @@ header {
   gap: 12px;
 }
 
+.logo-img {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  object-fit: cover;
+}
+
 .logo {
   font-size: 15px;
   font-weight: 700;
