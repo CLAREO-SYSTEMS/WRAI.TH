@@ -115,8 +115,12 @@ export class VaultBrowser {
     this.allTags = [...tagSet].sort();
     this.tagCounts = counts;
 
-    // Auto-expand top-level dirs
+    // Auto-expand: project-level folders + top-level dirs within each
     if (this._expandedDirs.size === 0) {
+      const projects = new Set(this.docs.map(d => d.project || "_unknown"));
+      if (projects.size > 1) {
+        for (const p of projects) this._expandedDirs.add(`__proj__${p}`);
+      }
       const topDirs = new Set();
       for (const d of this.docs) {
         const first = d.path.split("/")[0];
@@ -262,8 +266,76 @@ export class VaultBrowser {
       return;
     }
 
-    const tree = this._buildTree(filtered);
-    this._renderNode(tree, this._treeEl, "", 0);
+    // Group by project
+    const byProject = new Map();
+    for (const doc of filtered) {
+      const proj = doc.project || "_unknown";
+      if (!byProject.has(proj)) byProject.set(proj, []);
+      byProject.get(proj).push(doc);
+    }
+
+    // Render project-level folders
+    const sortedProjects = [...byProject.keys()].sort((a, b) => {
+      // _relay always last
+      if (a === "_relay") return 1;
+      if (b === "_relay") return -1;
+      return a.localeCompare(b);
+    });
+
+    for (const proj of sortedProjects) {
+      const projDocs = byProject.get(proj);
+      const projPath = `__proj__${proj}`;
+      const isExpanded = this._expandedDirs.has(projPath);
+
+      const dirEl = document.createElement("div");
+      dirEl.className = "vt-dir";
+
+      const dirRow = document.createElement("div");
+      dirRow.className = "vt-dir-row vt-project-row" + (isExpanded ? " expanded" : "");
+      dirRow.style.paddingLeft = "12px";
+
+      const chevron = document.createElement("span");
+      chevron.className = "vt-chevron";
+      chevron.textContent = isExpanded ? "\u25BE" : "\u25B8";
+
+      const icon = document.createElement("span");
+      icon.className = "vt-dir-icon";
+      icon.textContent = proj === "_relay" ? "\u2699" : "\uD83D\uDCDA";
+
+      const name = document.createElement("span");
+      name.className = "vt-dir-name vt-project-name";
+      name.textContent = proj === "_relay" ? "Relay Docs" : proj;
+
+      const count = document.createElement("span");
+      count.className = "vt-dir-count";
+      count.textContent = projDocs.length;
+
+      dirRow.appendChild(chevron);
+      dirRow.appendChild(icon);
+      dirRow.appendChild(name);
+      dirRow.appendChild(count);
+
+      dirRow.addEventListener("click", () => {
+        if (this._expandedDirs.has(projPath)) {
+          this._expandedDirs.delete(projPath);
+        } else {
+          this._expandedDirs.add(projPath);
+        }
+        this._renderTree();
+      });
+
+      dirEl.appendChild(dirRow);
+
+      if (isExpanded) {
+        const childContainer = document.createElement("div");
+        childContainer.className = "vt-children";
+        const tree = this._buildTree(projDocs);
+        this._renderNode(tree, childContainer, "", 1);
+        dirEl.appendChild(childContainer);
+      }
+
+      this._treeEl.appendChild(dirEl);
+    }
   }
 
   _renderNode(node, parentEl, pathPrefix, depth) {
@@ -615,49 +687,11 @@ export class VaultBrowser {
 
   _renderMarkdown(text) {
     if (!text) return "";
-
-    let html = text
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
-
-    // Fenced code blocks
-    html = html.replace(/^```(\w*)\n([\s\S]*?)^```$/gm, (_, lang, content) => {
-      const langLabel = lang ? `<span class="vault-code-lang">${lang}</span>` : "";
-      return `<pre>${langLabel}<code>${content.trimEnd()}</code></pre>`;
-    });
-
-    // Tables
-    html = html.replace(/^(\|.+\|)\n(\|[-| :]+\|)\n((?:\|.+\|\n?)+)/gm, (_, header, sep, body) => {
-      const ths = header.split("|").filter(c => c.trim()).map(c => `<th>${c.trim()}</th>`).join("");
-      const rows = body.trim().split("\n").map(row => {
-        const tds = row.split("|").filter(c => c.trim()).map(c => `<td>${c.trim()}</td>`).join("");
-        return `<tr>${tds}</tr>`;
-      }).join("");
-      return `<table><thead><tr>${ths}</tr></thead><tbody>${rows}</tbody></table>`;
-    });
-
-    // Headings
-    html = html.replace(/^#### (.+)$/gm, '<h5>$1</h5>');
-    html = html.replace(/^### (.+)$/gm, '<h4>$1</h4>');
-    html = html.replace(/^## (.+)$/gm, '<h3>$1</h3>');
-    html = html.replace(/^# (.+)$/gm, '<h2>$1</h2>');
-
-    html = html.replace(/^(-{3,}|\*{3,}|_{3,})$/gm, '<hr>');
-    html = html.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
-    html = html.replace(/<\/blockquote>\n<blockquote>/g, '<br>');
-
-    html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-    html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
-    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-
-    html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
-    html = html.replace(/^(\d+)\. (.+)$/gm, '<li>$2</li>');
-
-    html = html.replace(/\n{2,}/g, '<br><br>');
-    html = html.replace(/\n/g, '<br>');
-
-    return html;
+    if (typeof marked !== "undefined") {
+      marked.setOptions({ gfm: true, breaks: true });
+      return marked.parse(text);
+    }
+    // Fallback: plain text with escaped HTML
+    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, "<br>");
   }
 }

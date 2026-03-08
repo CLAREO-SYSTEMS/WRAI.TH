@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/assets/wraith-logo.jpeg" alt="wrai.th" width="200">
+<img src="docs/assets/wraith-banner.webp" alt="wrai.th" width="700">
 
 # wrai.th
 
@@ -13,7 +13,7 @@ Your AI agents are robots. Your projects are planets. You run the galaxy.
 [![Go](https://img.shields.io/badge/Go-00ADD8?style=for-the-badge&logo=go&logoColor=white)](https://go.dev)
 [![MCP](https://img.shields.io/badge/MCP-Protocol-8A2BE2?style=for-the-badge)](https://modelcontextprotocol.io)
 [![SQLite](https://img.shields.io/badge/SQLite-FTS5-003B57?style=for-the-badge&logo=sqlite&logoColor=white)](https://www.sqlite.org)
-[![License](https://img.shields.io/badge/MIT-yellow?style=for-the-badge)](LICENSE)
+[![License](https://img.shields.io/badge/AGPL--3.0-blue?style=for-the-badge)](LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/QPq7qfbEk8)
 
 [Quick Start](#-quick-start) · [How It Works](#-how-it-works) · [Agents](#-agents--hierarchy) · [Messaging](#-messaging--conversations) · [Memory](#-memory--knowledge) · [Goals & Tasks](#-goal-cascade--task-execution) · [Heartbeat](#-passive-vs-proactive--heartbeat-loops) · [MCP Tools](#-mcp-tools)
@@ -22,7 +22,9 @@ Your AI agents are robots. Your projects are planets. You run the galaxy.
 
 <img src="docs/screenshots/galaxy-view.png" alt="Galaxy View — projects orbit as pixel-art planets" width="800">
 
-*One binary. One SQLite file. 58 MCP tools. Zero config.*
+*One binary. One SQLite file. 58 MCP tools. Zero required config.*
+
+**100% local by default. Optional API key for team/server deployments. No cloud, no telemetry.**
 
 </div>
 
@@ -32,12 +34,12 @@ Your AI agents are robots. Your projects are planets. You run the galaxy.
 
 **macOS / Linux** (one-liner):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Synergix-lab/claude-agentic-relay/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Synergix-lab/WRAI.TH/main/install.sh | bash
 ```
 
 **Windows** (PowerShell):
 ```powershell
-irm https://raw.githubusercontent.com/Synergix-lab/claude-agentic-relay/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/Synergix-lab/WRAI.TH/main/install.ps1 | iex
 ```
 
 The installer builds from source (Go + GCC), falls back to prebuilt, sets up auto-start, installs the `/relay` skill, and configures your projects.
@@ -56,6 +58,40 @@ Connect any MCP client:
 ```
 
 That's it. Your agents register, talk, remember, and execute. You watch the galaxy.
+
+### Server Deployment
+
+For team use on a shared server, configure security via environment variables. **All settings are opt-in — without any env vars, behavior is identical to local mode.**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `8090` | Bind port |
+| `RELAY_API_KEY` | *(none)* | Shared secret. If set, all requests require `Authorization: Bearer <key>` |
+| `RELAY_CORS_ORIGINS` | *(none)* | Allowed origins (comma-separated). `*` for all |
+| `RELAY_MAX_BODY` | `0` (unlimited) | Max request body in bytes (e.g. `1048576` for 1MB) |
+| `RELAY_RATE_LIMIT` | `0` (disabled) | Requests/minute per IP |
+
+Example:
+```bash
+RELAY_API_KEY=my-team-secret RELAY_CORS_ORIGINS=https://relay.myteam.dev ./agent-relay serve
+```
+
+MCP client config with auth:
+```json
+{
+  "mcpServers": {
+    "agent-relay": {
+      "type": "http",
+      "url": "http://your-server:8090/mcp",
+      "headers": {
+        "Authorization": "Bearer my-team-secret"
+      }
+    }
+  }
+}
+```
+
+For TLS, put a reverse proxy (Caddy, nginx) in front.
 
 ### First project setup
 
@@ -935,6 +971,6 @@ cd client && pip install -e . && python -m src.main  # Start the client
 
 <div align="center">
 
-Fork maintained by [CLAREO-SYSTEMS](https://github.com/CLAREO-SYSTEMS) · Original by [synergix-lab](https://github.com/synergix-lab) · MIT License
+Fork maintained by [CLAREO-SYSTEMS](https://github.com/CLAREO-SYSTEMS) · Original by [synergix-lab](https://github.com/synergix-lab) · AGPL-3.0 License
 
 </div>
