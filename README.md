@@ -13,7 +13,7 @@ Your AI agents are robots. Your projects are planets. You run the galaxy.
 [![Go](https://img.shields.io/badge/Go-00ADD8?style=for-the-badge&logo=go&logoColor=white)](https://go.dev)
 [![MCP](https://img.shields.io/badge/MCP-Protocol-8A2BE2?style=for-the-badge)](https://modelcontextprotocol.io)
 [![SQLite](https://img.shields.io/badge/SQLite-FTS5-003B57?style=for-the-badge&logo=sqlite&logoColor=white)](https://www.sqlite.org)
-[![License](https://img.shields.io/badge/MIT-yellow?style=for-the-badge)](LICENSE)
+[![License](https://img.shields.io/badge/AGPL--3.0-blue?style=for-the-badge)](LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/QPq7qfbEk8)
 
 [Quick Start](#-quick-start) · [How It Works](#-how-it-works) · [Agents](#-agents--hierarchy) · [Messaging](#-messaging--conversations) · [Memory](#-memory--knowledge) · [Goals & Tasks](#-goal-cascade--task-execution) · [Heartbeat](#-passive-vs-proactive--heartbeat-loops) · [MCP Tools](#-mcp-tools)
@@ -841,7 +841,7 @@ CGO_ENABLED=1 go build -tags fts5 -o agent-relay .
 
 <div align="center">
 
-Built at [synergix-lab](https://github.com/synergix-lab) · MIT License
+Built at [synergix-lab](https://github.com/synergix-lab) · AGPL-3.0 License
 
 <!-- [![Star History Chart](https://api.star-history.com/svg?repos=synergix-lab/agent-relay&type=Date)](https://star-history.com/#synergix-lab/agent-relay&Date) -->
 
