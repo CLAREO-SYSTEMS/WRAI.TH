@@ -210,14 +210,16 @@ func migrate(conn *sql.DB) error {
 	// --- Ensure all columns exist on every table (safe for old and new DBs) ---
 
 	ensureColumns(conn, "agents", map[string]string{
-		"project":        "TEXT NOT NULL DEFAULT 'default'",
-		"reports_to":     "TEXT",
-		"profile_slug":   "TEXT",
-		"status":         "TEXT NOT NULL DEFAULT 'active'",
-		"deactivated_at": "TEXT",
-		"is_executive":   "INTEGER NOT NULL DEFAULT 0",
-		"session_id":     "TEXT",
-		"org_id":         "TEXT",
+		"project":           "TEXT NOT NULL DEFAULT 'default'",
+		"reports_to":        "TEXT",
+		"profile_slug":      "TEXT",
+		"status":            "TEXT NOT NULL DEFAULT 'active'",
+		"deactivated_at":    "TEXT",
+		"is_executive":      "INTEGER NOT NULL DEFAULT 0",
+		"session_id":        "TEXT",
+		"org_id":            "TEXT",
+		"interest_tags":     "TEXT NOT NULL DEFAULT '[]'",
+		"max_context_bytes": "INTEGER NOT NULL DEFAULT 16384",
 	})
 
 	// Projects table (planet_type assigned per project)
@@ -240,6 +242,9 @@ func migrate(conn *sql.DB) error {
 		"conversation_id": "TEXT",
 		"project":         "TEXT NOT NULL DEFAULT 'default'",
 		"task_id":         "TEXT",
+		"priority":        "TEXT NOT NULL DEFAULT 'P2'",
+		"ttl_seconds":     "INTEGER NOT NULL DEFAULT 3600",
+		"expired_at":      "TEXT",
 	})
 
 	ensureColumns(conn, "conversations", map[string]string{
@@ -252,6 +257,7 @@ func migrate(conn *sql.DB) error {
 	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_messages_project ON messages(project)`)
 	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id)`)
 	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_messages_task ON messages(task_id)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_messages_priority ON messages(priority)`)
 	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project)`)
 
 	// Remove old global UNIQUE constraint on agents.name (existing DBs only).
@@ -271,6 +277,40 @@ func migrate(conn *sql.DB) error {
 		UNIQUE(message_id, agent_name)
 	)`)
 	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_message_reads_agent ON message_reads(agent_name, project)`)
+
+	// Deliveries (per-recipient message tracking)
+	conn.Exec(`CREATE TABLE IF NOT EXISTS deliveries (
+		id              TEXT PRIMARY KEY,
+		message_id      TEXT NOT NULL,
+		to_agent        TEXT NOT NULL,
+		state           TEXT NOT NULL DEFAULT 'queued',
+		sequence_number INTEGER NOT NULL DEFAULT 0,
+		created_at      TEXT NOT NULL,
+		surfaced_at     TEXT,
+		acknowledged_at TEXT,
+		expired_at      TEXT,
+		project         TEXT NOT NULL DEFAULT 'default',
+		FOREIGN KEY (message_id) REFERENCES messages(id)
+	)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_deliveries_message ON deliveries(message_id)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_deliveries_agent_state ON deliveries(to_agent, project, state)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_deliveries_state ON deliveries(state)`)
+
+	// Backfill deliveries for existing messages
+	migrateDeliveries(conn)
+
+	// File locks
+	conn.Exec(`CREATE TABLE IF NOT EXISTS file_locks (
+		id          TEXT PRIMARY KEY,
+		agent_name  TEXT NOT NULL,
+		project     TEXT NOT NULL,
+		file_paths  TEXT NOT NULL,
+		claimed_at  TEXT NOT NULL,
+		released_at TEXT,
+		ttl_seconds INTEGER NOT NULL DEFAULT 1800
+	)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_file_locks_project ON file_locks(project)`)
+	conn.Exec(`CREATE INDEX IF NOT EXISTS idx_file_locks_agent ON file_locks(agent_name, project)`)
 
 	// Profiles
 	conn.Exec(`CREATE TABLE IF NOT EXISTS profiles (

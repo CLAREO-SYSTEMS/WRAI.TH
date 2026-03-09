@@ -53,6 +53,8 @@ func (r *Relay) ServeAPI(w http.ResponseWriter, req *http.Request) {
 		r.apiGetConversations(w, req)
 	case strings.HasPrefix(path, "/conversations/") && strings.HasSuffix(path, "/messages") && req.Method == http.MethodGet:
 		r.apiGetConversationMessages(w, path)
+	case path == "/messages" && req.Method == http.MethodGet:
+		r.apiGetAllMessages(w, req)
 	case path == "/messages/all-projects" && req.Method == http.MethodGet:
 		r.apiGetAllMessagesAllProjects(w)
 	case path == "/messages/latest-all" && req.Method == http.MethodGet:
@@ -80,6 +82,9 @@ func (r *Relay) ServeAPI(w http.ResponseWriter, req *http.Request) {
 		r.apiStreamActivity(w, req)
 	case path == "/events/stream" && req.Method == http.MethodGet:
 		r.apiStreamEvents(w, req)
+	// File locks
+	case path == "/file-locks" && req.Method == http.MethodGet:
+		r.apiGetFileLocks(w, req)
 	// Task endpoints
 	case path == "/tasks/all" && req.Method == http.MethodGet:
 		r.apiGetAllTasks(w)
@@ -579,11 +584,14 @@ func (r *Relay) apiPostUserResponse(w http.ResponseWriter, req *http.Request) {
 
 	replyTo := optionalString(body.ReplyTo)
 
-	msg, err := r.DB.InsertMessage(body.Project, "user", body.To, "response", "User response", body.Content, "{}", replyTo, nil)
+	msg, err := r.DB.InsertMessage(body.Project, "user", body.To, "response", "User response", body.Content, "{}", "P1", 3600, replyTo, nil)
 	if err != nil {
 		http.Error(w, `{"error":"failed to send response"}`, http.StatusInternalServerError)
 		return
 	}
+
+	// Create delivery record so the message appears in the agent's inbox
+	_ = r.DB.CreateDeliveries(msg.ID, body.Project, []string{body.To})
 
 	// Push notification to the target agent
 	r.Registry.Notify(body.Project, body.To, "user", "User response", msg.ID)
@@ -1547,4 +1555,20 @@ func (r *Relay) apiGetVaultStats(w http.ResponseWriter, req *http.Request) {
 		"doc_count":   count,
 		"total_bytes": totalSize,
 	})
+}
+
+func (r *Relay) apiGetFileLocks(w http.ResponseWriter, req *http.Request) {
+	project := req.URL.Query().Get("project")
+	if project == "" {
+		project = "default"
+	}
+	locks, err := r.DB.ListFileLocks(project)
+	if err != nil {
+		apiError(w, http.StatusInternalServerError, "failed to list file locks", err)
+		return
+	}
+	if locks == nil {
+		locks = []models.FileLock{}
+	}
+	writeJSON(w, locks)
 }
