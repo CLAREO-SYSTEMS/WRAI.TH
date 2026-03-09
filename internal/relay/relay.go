@@ -48,6 +48,7 @@ func New(database *db.DB, ingester *ingest.Ingester, vaultWatcher *vault.Watcher
 		server.ServerTool{Tool: registerAgentTool(), Handler: handlers.HandleRegisterAgent},
 		server.ServerTool{Tool: sendMessageTool(), Handler: handlers.HandleSendMessage},
 		server.ServerTool{Tool: getInboxTool(), Handler: handlers.HandleGetInbox},
+		server.ServerTool{Tool: ackDeliveryTool(), Handler: handlers.HandleAckDelivery},
 		server.ServerTool{Tool: getThreadTool(), Handler: handlers.HandleGetThread},
 		server.ServerTool{Tool: listAgentsTool(), Handler: handlers.HandleListAgents},
 		server.ServerTool{Tool: markReadTool(), Handler: handlers.HandleMarkRead},
@@ -95,6 +96,10 @@ func New(database *db.DB, ingester *ingest.Ingester, vaultWatcher *vault.Watcher
 		server.ServerTool{Tool: searchVaultTool(), Handler: handlers.HandleSearchVault},
 		server.ServerTool{Tool: getVaultDocTool(), Handler: handlers.HandleGetVaultDoc},
 		server.ServerTool{Tool: listVaultDocsTool(), Handler: handlers.HandleListVaultDocs},
+		// File locks
+		server.ServerTool{Tool: claimFilesTool(), Handler: handlers.HandleClaimFiles},
+		server.ServerTool{Tool: releaseFilesTool(), Handler: handlers.HandleReleaseFiles},
+		server.ServerTool{Tool: listLocksTool(), Handler: handlers.HandleListLocks},
 		// Agent lifecycle
 		server.ServerTool{Tool: deactivateAgentTool(), Handler: handlers.HandleDeactivateAgent},
 		server.ServerTool{Tool: deleteAgentTool(), Handler: handlers.HandleDeleteAgent},

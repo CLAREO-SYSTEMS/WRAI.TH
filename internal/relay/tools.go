@@ -30,6 +30,8 @@ func registerAgentTool() mcp.Tool {
 		mcp.WithBoolean("is_executive", mcp.Description("Mark this agent as an executive (shows crown on canvas)")),
 		mcp.WithString("profile_slug", mcp.Description("Profile archetype this agent runs (links to a registered profile)")),
 		mcp.WithString("session_id", mcp.Description("Claude Code session ID ($CLAUDE_SESSION_ID) — used for activity tracking via hooks")),
+		mcp.WithString("interest_tags", mcp.Description("JSON array of interest tags for context budget filtering (e.g. '[\"database\",\"auth\"]')")),
+		mcp.WithNumber("max_context_bytes", mcp.Description("Max bytes for budget-pruned inbox (default: 16384)")),
 	)
 }
 
@@ -49,6 +51,11 @@ func sendMessageTool() mcp.Tool {
 		mcp.WithString("reply_to", mcp.Description("Message ID to reply to (for threading)")),
 		mcp.WithString("metadata", mcp.Description("JSON string of additional metadata")),
 		mcp.WithString("conversation_id", mcp.Description("Send message to a conversation instead of a single agent")),
+		mcp.WithString("priority",
+			mcp.Description("Message priority. P0=interrupt (critical), P1=steering (important), P2=advisory (default), P3=info (low). MACP aliases accepted."),
+			mcp.Enum("P0", "P1", "P2", "P3", "interrupt", "steering", "advisory", "info"),
+		),
+		mcp.WithNumber("ttl_seconds", mcp.Description("Time-to-live in seconds (default: 3600 = 1h, 0 = never expires). Expired messages are excluded from inbox.")),
 	)
 }
 
@@ -61,6 +68,15 @@ func getInboxTool() mcp.Tool {
 		mcp.WithBoolean("unread_only", mcp.Description("Only return unread messages (default: true)")),
 		mcp.WithNumber("limit", mcp.Description("Max number of messages to return (default: 10).")),
 		mcp.WithBoolean("full_content", mcp.Description("Return full message content instead of truncating to 300 chars (default: false)")),
+		mcp.WithBoolean("apply_budget", mcp.Description("Apply context budget pruning: filters messages by priority, tag relevance, and freshness to fit within agent's max_context_bytes (default: false)")),
+	)
+}
+
+func ackDeliveryTool() mcp.Tool {
+	return mcp.NewTool(
+		"ack_delivery",
+		mcp.WithDescription("Acknowledge receipt of a message delivery. Transitions delivery state from surfaced to acknowledged. Use the delivery_id returned by get_inbox."),
+		mcp.WithString("delivery_id", mcp.Description("Delivery ID to acknowledge"), mcp.Required()),
 	)
 }
 
@@ -574,6 +590,37 @@ func listVaultDocsTool() mcp.Tool {
 		projectParam,
 		mcp.WithString("tags", mcp.Description("JSON array of tags to filter by")),
 		mcp.WithNumber("limit", mcp.Description("Max results (default: 100)")),
+	)
+}
+
+// --- File locks ---
+
+func claimFilesTool() mcp.Tool {
+	return mcp.NewTool(
+		"claim_files",
+		mcp.WithDescription("Declare which files you are editing. Broadcasts a steering-priority message to all agents in the project. Other agents should avoid editing these files."),
+		asParam,
+		projectParam,
+		mcp.WithString("file_paths", mcp.Description("JSON array of file paths being claimed (e.g. '[\"src/auth.go\",\"src/db.go\"]')"), mcp.Required()),
+		mcp.WithNumber("ttl_seconds", mcp.Description("How long the claim lasts (default: 1800 = 30min)")),
+	)
+}
+
+func releaseFilesTool() mcp.Tool {
+	return mcp.NewTool(
+		"release_files",
+		mcp.WithDescription("Release previously claimed files. Broadcasts an info-priority message."),
+		asParam,
+		projectParam,
+		mcp.WithString("file_paths", mcp.Description("JSON array of file paths to release (must match a previous claim)"), mcp.Required()),
+	)
+}
+
+func listLocksTool() mcp.Tool {
+	return mcp.NewTool(
+		"list_locks",
+		mcp.WithDescription("List all active file locks in a project. Shows which agent holds which files."),
+		projectParam,
 	)
 }
 

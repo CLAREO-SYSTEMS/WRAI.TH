@@ -106,8 +106,10 @@ func (h *Handlers) HandleRegisterAgent(ctx context.Context, req mcp.CallToolRequ
 	profileSlug := optionalString(req.GetString("profile_slug", ""))
 	isExecutive := req.GetBool("is_executive", false)
 	sessionID := optionalString(req.GetString("session_id", ""))
+	interestTags := req.GetString("interest_tags", "[]")
+	maxContextBytes := req.GetInt("max_context_bytes", 16384)
 
-	agent, isRespawn, err := h.db.RegisterAgent(project, name, role, description, reportsTo, profileSlug, isExecutive, sessionID)
+	agent, isRespawn, err := h.db.RegisterAgent(project, name, role, description, reportsTo, profileSlug, isExecutive, sessionID, interestTags, maxContextBytes)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to register agent: %v", err)), nil
 	}
@@ -147,6 +149,8 @@ func (h *Handlers) HandleSendMessage(ctx context.Context, req mcp.CallToolReques
 	metadata := req.GetString("metadata", "{}")
 	replyTo := optionalString(req.GetString("reply_to", ""))
 	conversationID := optionalString(req.GetString("conversation_id", ""))
+	priority := mapPriority(req.GetString("priority", "P2"))
+	ttlSeconds := req.GetInt("ttl_seconds", 3600)
 
 	// Support "to": "conversation:<id>" shorthand
 	if conversationID == nil && strings.HasPrefix(to, "conversation:") {
@@ -193,7 +197,7 @@ func (h *Handlers) HandleSendMessage(ctx context.Context, req mcp.CallToolReques
 			return mcp.NewToolResultError(fmt.Sprintf("team '%s' not found", teamSlug)), nil
 		}
 
-		msg, err := h.db.InsertMessage(project, from, to, msgType, subject, content, metadata, replyTo, conversationID)
+		msg, err := h.db.InsertMessage(project, from, to, msgType, subject, content, metadata, priority, ttlSeconds, replyTo, conversationID)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("failed to send message: %v", err)), nil
 		}
@@ -201,13 +205,16 @@ func (h *Handlers) HandleSendMessage(ctx context.Context, req mcp.CallToolReques
 		// Add to team inbox
 		_ = h.db.AddToTeamInbox(team.ID, msg.ID)
 
-		// Notify all team members
+		// Create deliveries for team members
 		members, _ := h.db.GetTeamMemberNames(team.ID)
+		var recipients []string
 		for _, member := range members {
 			if member != from {
+				recipients = append(recipients, member)
 				h.registry.Notify(project, member, from, subject, msg.ID)
 			}
 		}
+		_ = h.db.CreateDeliveries(msg.ID, project, recipients)
 
 		return resultJSON(msg)
 	}
@@ -223,10 +230,14 @@ func (h *Handlers) HandleSendMessage(ctx context.Context, req mcp.CallToolReques
 		}
 	}
 
-	msg, err := h.db.InsertMessage(project, from, to, msgType, subject, content, metadata, replyTo, conversationID)
+	msg, err := h.db.InsertMessage(project, from, to, msgType, subject, content, metadata, priority, ttlSeconds, replyTo, conversationID)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to send message: %v", err)), nil
 	}
+
+	// Create deliveries
+	recipients, _ := h.db.ResolveRecipients(project, to, from, conversationID)
+	_ = h.db.CreateDeliveries(msg.ID, project, recipients)
 
 	// Push notification
 	if conversationID != nil {
@@ -246,8 +257,12 @@ func (h *Handlers) HandleGetInbox(ctx context.Context, req mcp.CallToolRequest) 
 	unreadOnly := req.GetBool("unread_only", true)
 	limit := req.GetInt("limit", 10)
 	fullContent := req.GetBool("full_content", false)
+	budgetMode := req.GetBool("apply_budget", false)
 
 	_ = h.db.TouchAgent(project, agent)
+
+	// Expire stale messages before querying
+	h.db.ExpireMessages()
 
 	messages, err := h.db.GetInbox(project, agent, unreadOnly, limit)
 	if err != nil {
@@ -255,6 +270,16 @@ func (h *Handlers) HandleGetInbox(ctx context.Context, req mcp.CallToolRequest) 
 	}
 	if messages == nil {
 		messages = []models.Message{}
+	}
+
+	// Apply context budget pruning if requested
+	if budgetMode && len(messages) > 0 {
+		agentObj, _ := h.db.GetAgent(project, agent)
+		if agentObj != nil {
+			var tags []string
+			json.Unmarshal([]byte(agentObj.InterestTags), &tags)
+			messages = applyBudget(messages, tags, agentObj.MaxContextBytes)
+		}
 	}
 
 	formatted := make([]map[string]any, len(messages))
@@ -271,12 +296,19 @@ func (h *Handlers) HandleGetInbox(ctx context.Context, req mcp.CallToolRequest) 
 			"subject":    m.Subject,
 			"content":    content,
 			"created_at": m.CreatedAt,
+			"priority":   m.Priority,
 		}
 		if m.ReplyTo != nil {
 			entry["reply_to"] = *m.ReplyTo
 		}
 		if m.ConversationID != nil {
 			entry["conversation_id"] = *m.ConversationID
+		}
+		if m.DeliveryID != nil {
+			entry["delivery_id"] = *m.DeliveryID
+		}
+		if m.DeliveryState != nil {
+			entry["delivery_state"] = *m.DeliveryState
 		}
 		formatted[i] = entry
 	}
@@ -286,6 +318,17 @@ func (h *Handlers) HandleGetInbox(ctx context.Context, req mcp.CallToolRequest) 
 		"count":    len(messages),
 		"messages": formatted,
 	})
+}
+
+func (h *Handlers) HandleAckDelivery(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	deliveryID := req.GetString("delivery_id", "")
+	if deliveryID == "" {
+		return mcp.NewToolResultError("delivery_id is required"), nil
+	}
+	if err := h.db.AcknowledgeDelivery(deliveryID); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to acknowledge delivery: %v", err)), nil
+	}
+	return resultJSON(map[string]any{"acknowledged": deliveryID})
 }
 
 func (h *Handlers) HandleGetThread(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -656,6 +699,22 @@ func optionalStringLower(s string) *string {
 	return &l
 }
 
+// mapPriority normalizes MACP aliases to P0-P3.
+func mapPriority(p string) string {
+	switch strings.ToLower(p) {
+	case "interrupt", "p0":
+		return "P0"
+	case "steering", "p1":
+		return "P1"
+	case "advisory", "p2", "":
+		return "P2"
+	case "info", "p3":
+		return "P3"
+	default:
+		return "P2"
+	}
+}
+
 func sessionFromContext(ctx context.Context) clientSession {
 	if sess, ok := ctx.Value(sessionKey).(clientSession); ok {
 		return sess
@@ -790,6 +849,12 @@ func (h *Handlers) HandleListMemories(ctx context.Context, req mcp.CallToolReque
 	agentFilter := req.GetString("agent", "")
 	tags := req.GetStringSlice("tags", nil)
 	limit := req.GetInt("limit", 50)
+
+	// Bug fix: scope=agent must be filtered by the calling agent to prevent leaking
+	// other agents' private memories. If no explicit agent filter, use the caller's identity.
+	if scope == "agent" && agentFilter == "" {
+		agentFilter = resolveAgent(req)
+	}
 
 	memories, err := h.db.ListMemories(project, scope, agentFilter, tags, limit)
 	if err != nil {
@@ -1223,6 +1288,61 @@ func (h *Handlers) HandleListTasks(ctx context.Context, req mcp.CallToolRequest)
 	return resultJSON(map[string]any{
 		"count": len(tasks),
 		"tasks": tasks,
+	})
+}
+
+// --- File locks ---
+
+func (h *Handlers) HandleClaimFiles(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	agent := resolveAgent(req)
+	filePaths := req.GetString("file_paths", "[]")
+	ttlSeconds := req.GetInt("ttl_seconds", 1800)
+
+	lock, err := h.db.ClaimFiles(project, agent, filePaths, ttlSeconds)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to claim files: %v", err)), nil
+	}
+
+	// Auto-broadcast steering message
+	subject := fmt.Sprintf("%s claimed files", agent)
+	content := fmt.Sprintf("%s is now editing: %s", agent, filePaths)
+	h.db.InsertMessage(project, agent, "*", "notification", subject, content, fmt.Sprintf(`{"tags":["file-lock"],"file_paths":%s}`, filePaths), "P1", 0, nil, nil)
+
+	return resultJSON(lock)
+}
+
+func (h *Handlers) HandleReleaseFiles(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+	agent := resolveAgent(req)
+	filePaths := req.GetString("file_paths", "[]")
+
+	if err := h.db.ReleaseFiles(project, agent, filePaths); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to release files: %v", err)), nil
+	}
+
+	// Auto-broadcast info message
+	subject := fmt.Sprintf("%s released files", agent)
+	content := fmt.Sprintf("%s released: %s", agent, filePaths)
+	h.db.InsertMessage(project, agent, "*", "notification", subject, content, fmt.Sprintf(`{"tags":["file-lock"],"file_paths":%s}`, filePaths), "P3", 3600, nil, nil)
+
+	return resultJSON(map[string]any{"released": filePaths})
+}
+
+func (h *Handlers) HandleListLocks(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	project := resolveProject(req)
+
+	locks, err := h.db.ListFileLocks(project)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to list locks: %v", err)), nil
+	}
+	if locks == nil {
+		locks = []models.FileLock{}
+	}
+
+	return resultJSON(map[string]any{
+		"count": len(locks),
+		"locks": locks,
 	})
 }
 
