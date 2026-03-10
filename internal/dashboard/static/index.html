@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WRAI.TH — Mission Control</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/dashboard.css">
+  <script src="https://cdn.jsdelivr.net/npm/marked/lib/marked.umd.js"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11"></script>
+</head>
+<body>
+  <header>
+    <div class="header-left">
+      <span class="logo">wrai<span class="dot">.</span>th</span>
+      <span class="sep">|</span>
+      <span class="title">Mission Control</span>
+    </div>
+    <div class="header-right">
+      <div class="stat-group">
+        <span class="stat-label">Agents</span>
+        <span id="agent-count" class="stat-value">0</span>
+      </div>
+      <div class="stat-group">
+        <span class="stat-label">Machines</span>
+        <span id="machine-count" class="stat-value">0</span>
+      </div>
+      <span id="connection-dot" class="connection-dot disconnected"></span>
+    </div>
+  </header>
+
+  <main>
+    <!-- Fleet Grid -->
+    <section id="fleet-section">
+      <div class="section-header">
+        <h2>Fleet</h2>
+        <button id="spawn-btn" class="spawn-btn">+ Spawn</button>
+      </div>
+      <div id="fleet-grid" class="fleet-grid"></div>
+    </section>
+
+    <!-- Machine Map -->
+    <section id="machine-section">
+      <h2>Infrastructure</h2>
+      <canvas id="machine-canvas" width="1200" height="480"></canvas>
+    </section>
+  </main>
+
+  <!-- Terminal Panel (slide-in) -->
+  <div id="terminal-overlay" class="terminal-overlay hidden">
+    <div id="terminal-panel" class="terminal-panel">
+      <div class="terminal-header">
+        <div class="terminal-header-left">
+          <button id="terminal-close" class="terminal-close">&larr;</button>
+          <span id="terminal-agent-name" class="terminal-agent-name">agent</span>
+          <span id="terminal-agent-state" class="agent-state state-idle">idle</span>
+        </div>
+        <div class="terminal-header-right">
+          <span id="terminal-agent-machine" class="terminal-meta"></span>
+          <span id="terminal-turn-count" class="terminal-meta"></span>
+        </div>
+      </div>
+      <div id="terminal-output" class="terminal-output">
+        <!-- Terminal lines rendered here -->
+      </div>
+      <div class="terminal-input-area">
+        <span class="terminal-prompt">&gt;</span>
+        <textarea id="terminal-input" class="terminal-input" placeholder="Send message to agent..." rows="1"></textarea>
+        <button id="terminal-send" class="terminal-send-btn">Send</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Spawn Modal -->
+  <div id="spawn-modal" class="modal-overlay hidden">
+    <div class="modal-panel">
+      <div class="modal-header">
+        <span class="modal-title">Spawn Agent</span>
+        <button id="spawn-modal-close" class="terminal-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-field">
+          <label class="modal-label">Agent</label>
+          <select id="spawn-agent-select" class="modal-select"></select>
+        </div>
+        <div class="modal-field">
+          <label class="modal-label">Target Machine</label>
+          <select id="spawn-machine-select" class="modal-select"></select>
+        </div>
+        <div id="spawn-status" class="spawn-status"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="spawn-cancel" class="modal-btn modal-btn-cancel">Cancel</button>
+        <button id="spawn-confirm" class="modal-btn modal-btn-confirm">Spawn</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="js/dashboard.js"></script>
+</body>
+</html>

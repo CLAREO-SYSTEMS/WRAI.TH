@@ -1,8 +1,13 @@
 package client
 
 import (
+	"agent-relay/internal/monitor"
 	"context"
+	"encoding/json"
+	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -22,7 +27,10 @@ type Manager struct {
 	sse      *SSEClient
 	sessions map[string]*Session
 
+	tracker *monitor.Tracker
+
 	mu      sync.RWMutex
+	ctx     context.Context
 	cancel  context.CancelFunc
 }
 
@@ -44,12 +52,30 @@ func NewManager(cfg *Config) *Manager {
 		log.Printf("[manager] registered %s (machine=%s)", name, cfg.Machine.Name)
 	}
 
+	// Restore session IDs from previous run (enables --resume after redeploy)
+	m.loadSessionState()
+
 	return m
+}
+
+// SetTracker sets the cost/token tracker.
+func (m *Manager) SetTracker(t *monitor.Tracker) {
+	m.tracker = t
+}
+
+// Relay returns the relay client for shared use.
+func (m *Manager) Relay() *RelayClient {
+	return m.relay
+}
+
+// SSE returns the SSE client (available after Start).
+func (m *Manager) SSE() *SSEClient {
+	return m.sse
 }
 
 // Start begins the SSE listener and health checks.
 func (m *Manager) Start(ctx context.Context) error {
-	ctx, m.cancel = context.WithCancel(ctx)
+	m.ctx, m.cancel = context.WithCancel(ctx)
 
 	// Setup SSE
 	reconnect := time.Duration(m.config.SSE.ReconnectDelaySec * float64(time.Second))
@@ -64,10 +90,16 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.sse.On("register", m.onRegister)
 
 	// Start SSE in background
-	go m.sse.Run(ctx)
+	go m.sse.Run(m.ctx)
 
 	// Start health check loop
-	go m.healthLoop(ctx)
+	go m.healthLoop(m.ctx)
+
+	// Pre-register all local agents with the relay (V0.3.1 improvement)
+	// This ensures the relay knows about agents before they spawn,
+	// auto-creates admin teams for executives, and passes max_context_bytes
+	// for proper budget pruning.
+	go m.registerAllAgents()
 
 	// Initial inbox check — catch messages missed while offline
 	go m.initialInboxCheck()
@@ -77,20 +109,80 @@ func (m *Manager) Start(ctx context.Context) error {
 }
 
 // Stop gracefully shuts down all sessions.
+// Gives running subprocesses up to gracePeriod to finish, then kills them.
 func (m *Manager) Stop() {
+	log.Printf("[manager] shutting down...")
+
+	// Cancel the manager context (stops SSE, health loop, new spawns)
 	if m.cancel != nil {
 		m.cancel()
 	}
 
+	// Collect running sessions
 	m.mu.RLock()
-	defer m.mu.RUnlock()
+	var running []*Session
+	for _, s := range m.sessions {
+		if s.IsRunning() {
+			running = append(running, s)
+		}
+	}
+	m.mu.RUnlock()
 
+	if len(running) > 0 {
+		log.Printf("[manager] waiting for %d running agent(s) to finish (max 30s)...", len(running))
+
+		// Wait up to 30 seconds for in-progress turns
+		deadline := time.After(30 * time.Second)
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+
+	waitLoop:
+		for {
+			select {
+			case <-deadline:
+				log.Printf("[manager] grace period expired, killing remaining subprocesses")
+				for _, s := range running {
+					if s.IsRunning() {
+						log.Printf("[manager] killing %s", s.Name)
+						s.Kill()
+					}
+				}
+				// Brief wait for kill to take effect
+				time.Sleep(time.Second)
+				break waitLoop
+			case <-ticker.C:
+				allDone := true
+				for _, s := range running {
+					if s.IsRunning() {
+						allDone = false
+						break
+					}
+				}
+				if allDone {
+					log.Printf("[manager] all agents finished cleanly")
+					break waitLoop
+				}
+			}
+		}
+	}
+
+	// Mark all agents as sleeping in the relay
+	m.mu.RLock()
 	for name, s := range m.sessions {
-		if s.GetState() == StateWorking || s.GetState() == StateIdle {
+		state := s.GetState()
+		if state == StateWorking || state == StateIdle {
 			if err := m.relay.SleepAgent(name); err != nil {
 				log.Printf("[manager] failed to sleep %s: %v", name, err)
 			}
 		}
+	}
+	m.mu.RUnlock()
+
+	// Persist session IDs for resume after redeploy
+	m.saveSessionState()
+
+	if m.tracker != nil {
+		m.tracker.Save()
 	}
 
 	log.Printf("[manager] stopped")
@@ -118,8 +210,43 @@ func (m *Manager) GetAllStates() map[string]map[string]interface{} {
 			"session_id":  s.SessionID,
 			"machine":     m.config.Machine.Name,
 		}
+		if m.tracker != nil {
+			inTok, outTok := m.tracker.AgentTokens(name)
+			states[name]["tokens_used"] = inTok + outTok
+			states[name]["token_limit"] = 0 // no hard limit on Max plan
+		}
 	}
 	return states
+}
+
+// SpawnAgent triggers a spawn/wake for a named agent from external callers (e.g. dashboard).
+// Returns an error if the agent is unknown or already working.
+func (m *Manager) SpawnAgent(name, reason string) error {
+	m.mu.RLock()
+	s, ok := m.sessions[name]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("unknown agent: %s", name)
+	}
+	state := s.GetState()
+	if state == StateWorking {
+		return fmt.Errorf("agent %s is already working", name)
+	}
+	if state == StateDead {
+		return fmt.Errorf("agent %s is dead", name)
+	}
+	go m.spawnOrWake(s, reason)
+	return nil
+}
+
+// AllAgentConfigs returns the full agent config map (all machines).
+func (m *Manager) AllAgentConfigs() map[string]AgentConfig {
+	return m.config.Agents
+}
+
+// MachineName returns the local machine name.
+func (m *Manager) MachineName() string {
+	return m.config.Machine.Name
 }
 
 // --- SSE Event Handlers ---
@@ -287,41 +414,57 @@ func (m *Manager) spawnOrWake(s *Session, reason string) {
 		// Already spawned before — resume
 		inbox, _ := m.relay.GetInbox(s.Name, true)
 		prompt := BuildWakePrompt(reason, inbox)
-		_, err := s.Resume(context.Background(), prompt)
+		result, err := s.Resume(m.ctx, prompt)
 		if err != nil {
 			log.Printf("[manager] resume %s failed: %v", s.Name, err)
 			m.retryCrash(s, prompt, true)
+		}
+		if m.tracker != nil && result != nil {
+			m.tracker.Record(s.Name, result.Model, result.CostUSD, result.Duration, s.TurnCount, result.InputTokens, result.OutputTokens)
 		}
 		return
 	}
 
 	// First spawn — full boot
-	ctx, _ := m.relay.GetSessionContext(s.Name)
+	sessionCtx, _ := m.relay.GetSessionContext(s.Name)
 	inbox, _ := m.relay.GetInbox(s.Name, true)
-	prompt := BuildBootPrompt(s.Name, s.Config, ctx, inbox)
+	prompt := BuildBootPrompt(s.Name, s.Config, sessionCtx, inbox)
 
-	_, err := s.Spawn(context.Background(), prompt)
+	result, err := s.Spawn(m.ctx, prompt)
 	if err != nil {
 		log.Printf("[manager] spawn %s failed: %v", s.Name, err)
 		m.retryCrash(s, prompt, false)
+	}
+	if m.tracker != nil && result != nil {
+		m.tracker.Record(s.Name, result.Model, result.CostUSD, result.Duration, s.TurnCount, result.InputTokens, result.OutputTokens)
 	}
 }
 
 func (m *Manager) retryCrash(s *Session, prompt string, isResume bool) {
 	for attempt := 1; attempt < maxCrashRetries && s.CrashCount < maxCrashRetries; attempt++ {
+		// Bail if manager is shutting down
+		if m.ctx.Err() != nil {
+			return
+		}
+
 		delay := backoffBase * time.Duration(1<<uint(attempt-1))
 		if delay > backoffMax {
 			delay = backoffMax
 		}
 
 		log.Printf("[manager] retry %s in %v (attempt %d/%d)", s.Name, delay, attempt, maxCrashRetries)
-		time.Sleep(delay)
+
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-time.After(delay):
+		}
 
 		var err error
 		if isResume {
-			_, err = s.Resume(context.Background(), prompt)
+			_, err = s.Resume(m.ctx, prompt)
 		} else {
-			_, err = s.Spawn(context.Background(), prompt)
+			_, err = s.Spawn(m.ctx, prompt)
 		}
 
 		if err == nil {
@@ -407,6 +550,34 @@ func (m *Manager) initialInboxCheck() {
 	}
 }
 
+// registerAllAgents pre-registers local agents with the relay.
+// Benefits: relay knows agents exist before first spawn, executives auto-get
+// admin team membership (broadcast permissions), and max_context_bytes is
+// passed for proper budget pruning.
+func (m *Manager) registerAllAgents() {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for name, s := range m.sessions {
+		cfg := s.Config
+		_, err := m.relay.RegisterAgent(RegisterOpts{
+			Name:            name,
+			Role:            cfg.Role,
+			ReportsTo:       cfg.ReportsTo,
+			ProfileSlug:     cfg.ProfileSlug,
+			IsExecutive:     cfg.IsExecutive,
+			SessionID:       s.SessionID,
+			InterestTags:    cfg.InterestTags,
+			MaxContextBytes: cfg.MaxContextBytes,
+		})
+		if err != nil {
+			log.Printf("[manager] pre-register %s failed: %v (will register on first spawn)", name, err)
+			continue
+		}
+		log.Printf("[manager] pre-registered %s (profile=%s, executive=%v)", name, cfg.ProfileSlug, cfg.IsExecutive)
+	}
+}
+
 // --- Wake Decision Matrix ---
 
 // Priority-aware wake decisions.
@@ -456,6 +627,79 @@ func shouldWakeTask(state SessionState, priority string) bool {
 		return state != StateWorking && state != StateDead
 	default:
 		return false
+	}
+}
+
+// --- Session State Persistence ---
+
+type savedState struct {
+	Sessions map[string]savedSession `json:"sessions"`
+}
+
+type savedSession struct {
+	SessionID string `json:"session_id"`
+	TurnCount int    `json:"turn_count"`
+}
+
+func (m *Manager) stateFilePath() string {
+	return filepath.Join(m.config.Machine.DownloadDir, ".wraith-sessions.json")
+}
+
+func (m *Manager) saveSessionState() {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	state := savedState{Sessions: make(map[string]savedSession)}
+	for name, s := range m.sessions {
+		if s.TurnCount > 0 {
+			state.Sessions[name] = savedSession{
+				SessionID: s.SessionID,
+				TurnCount: s.TurnCount,
+			}
+		}
+	}
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		log.Printf("[manager] failed to marshal session state: %v", err)
+		return
+	}
+
+	os.MkdirAll(filepath.Dir(m.stateFilePath()), 0755)
+	if err := os.WriteFile(m.stateFilePath(), data, 0644); err != nil {
+		log.Printf("[manager] failed to save session state: %v", err)
+		return
+	}
+	log.Printf("[manager] saved session state for %d agent(s)", len(state.Sessions))
+}
+
+func (m *Manager) loadSessionState() {
+	data, err := os.ReadFile(m.stateFilePath())
+	if err != nil {
+		return // no state file — fresh start
+	}
+
+	var state savedState
+	if err := json.Unmarshal(data, &state); err != nil {
+		log.Printf("[manager] failed to parse session state: %v", err)
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	restored := 0
+	for name, saved := range state.Sessions {
+		if s, ok := m.sessions[name]; ok {
+			s.SessionID = saved.SessionID
+			s.TurnCount = saved.TurnCount
+			s.SetState(StateSleeping) // was running before shutdown
+			restored++
+			log.Printf("[manager] restored session %s (id=%s, turns=%d)", name, saved.SessionID, saved.TurnCount)
+		}
+	}
+	if restored > 0 {
+		log.Printf("[manager] restored %d session(s) from previous run", restored)
 	}
 }
 

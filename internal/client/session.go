@@ -49,13 +49,23 @@ func (s SessionState) String() string {
 
 // TurnResult captures the output of a single Claude turn.
 type TurnResult struct {
-	Output   string
-	CostUSD  float64
-	Model    string
-	ExitCode int
-	Duration time.Duration
-	Messages []map[string]interface{} // raw stream-json messages
+	Output       string
+	CostUSD      float64
+	Model        string
+	ExitCode     int
+	Duration     time.Duration
+	Messages     []map[string]interface{} // raw stream-json messages
+	InputTokens  int
+	OutputTokens int
 }
+
+// TerminalLine represents one line of output for the dashboard terminal viewer.
+type TerminalLine struct {
+	Type string `json:"type"` // system, assistant, tool-use, tool-result, error, user-msg
+	Text string `json:"text"`
+}
+
+const maxTerminalLines = 500
 
 // Session manages a single agent's Claude subprocess lifecycle.
 type Session struct {
@@ -71,7 +81,12 @@ type Session struct {
 	relayURL     string
 	relayProject string
 
-	mu sync.Mutex
+	cmd    *exec.Cmd // currently running subprocess (nil if idle)
+	cancel context.CancelFunc // cancel for current turn's context
+	mu     sync.Mutex
+
+	termBuf   []TerminalLine // ring buffer of terminal output
+	termBufMu sync.Mutex
 }
 
 // NewSession creates a new agent session.
@@ -133,6 +148,22 @@ func (s *Session) Resume(ctx context.Context, prompt string) (*TurnResult, error
 	return result, nil
 }
 
+// Kill cancels any in-progress turn, causing the subprocess to be terminated.
+func (s *Session) Kill() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cancel != nil {
+		s.cancel()
+	}
+}
+
+// IsRunning returns true if a subprocess is currently active.
+func (s *Session) IsRunning() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cmd != nil
+}
+
 // SetState updates the session state (thread-safe).
 func (s *Session) SetState(state SessionState) {
 	s.mu.Lock()
@@ -145,6 +176,99 @@ func (s *Session) GetState() SessionState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.State
+}
+
+// GetTerminalLines returns a snapshot of the terminal output buffer.
+func (s *Session) GetTerminalLines() []TerminalLine {
+	s.termBufMu.Lock()
+	defer s.termBufMu.Unlock()
+	out := make([]TerminalLine, len(s.termBuf))
+	copy(out, s.termBuf)
+	return out
+}
+
+// appendTermLine adds a line to the terminal buffer, evicting old entries if full.
+func (s *Session) appendTermLine(typ, text string) {
+	s.termBufMu.Lock()
+	defer s.termBufMu.Unlock()
+	if len(s.termBuf) >= maxTerminalLines {
+		s.termBuf = s.termBuf[1:]
+	}
+	s.termBuf = append(s.termBuf, TerminalLine{Type: typ, Text: text})
+}
+
+// AppendUserMessage adds a user-sent message to the terminal buffer.
+func (s *Session) AppendUserMessage(text string) {
+	s.appendTermLine("user-msg", "[you] "+text)
+}
+
+func (s *Session) classifyTermLine(msg map[string]interface{}) {
+	msgType, _ := msg["type"].(string)
+
+	switch msgType {
+	case "system":
+		if text, ok := msg["message"].(string); ok {
+			s.appendTermLine("system", text)
+		}
+
+	case "assistant":
+		// Assistant message with content blocks
+		if m, ok := msg["message"].(map[string]interface{}); ok {
+			if content, ok := m["content"].([]interface{}); ok {
+				for _, block := range content {
+					b, ok := block.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					blockType, _ := b["type"].(string)
+					switch blockType {
+					case "text":
+						if text, ok := b["text"].(string); ok && text != "" {
+							s.appendTermLine("assistant", text)
+						}
+					case "tool_use":
+						name, _ := b["name"].(string)
+						inputJSON, _ := json.Marshal(b["input"])
+						s.appendTermLine("tool-use", fmt.Sprintf("Tool: %s %s", name, string(inputJSON)))
+					}
+				}
+			}
+		}
+
+	case "tool_result", "content_block_start":
+		// Tool result
+		if m, ok := msg["message"].(map[string]interface{}); ok {
+			if content, ok := m["content"].([]interface{}); ok {
+				for _, block := range content {
+					b, ok := block.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					if text, ok := b["text"].(string); ok && text != "" {
+						s.appendTermLine("tool-result", text)
+					}
+				}
+			}
+		}
+
+	case "error":
+		if text, ok := msg["error"].(string); ok {
+			s.appendTermLine("error", text)
+		} else if m, ok := msg["message"].(string); ok {
+			s.appendTermLine("error", m)
+		}
+
+	case "result":
+		// Final result — extract token usage
+		if usage, ok := msg["usage"].(map[string]interface{}); ok {
+			if in, ok := usage["input_tokens"].(float64); ok {
+				s.mu.Lock()
+				// Store for later retrieval — we'll use a side channel
+				s.mu.Unlock()
+				_ = in
+			}
+		}
+	}
 }
 
 func (s *Session) buildArgs(resume bool) []string {
@@ -184,8 +308,24 @@ func (s *Session) runTurn(ctx context.Context, args []string, prompt string) (*T
 		args = append(args, "--settings", hooksJSON)
 	}
 
-	cmd := exec.CommandContext(ctx, "claude", args...)
+	// Derive a cancelable context so Stop() can kill mid-turn
+	turnCtx, turnCancel := context.WithCancel(ctx)
+
+	cmd := exec.CommandContext(turnCtx, "claude", args...)
 	cmd.Dir = s.Config.WorkDir
+
+	// Track running subprocess for graceful shutdown
+	s.mu.Lock()
+	s.cmd = cmd
+	s.cancel = turnCancel
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		s.cmd = nil
+		s.cancel = nil
+		s.mu.Unlock()
+	}()
 
 	// Clean env: remove CLAUDECODE to allow nesting, inject session ID
 	cmd.Env = cleanEnv()
@@ -204,6 +344,7 @@ func (s *Session) runTurn(ctx context.Context, args []string, prompt string) (*T
 	cmd.Stderr = os.Stderr
 
 	log.Printf("[session:%s] spawning turn %d (resume=%v)", s.Name, s.TurnCount+1, strings.Contains(fmt.Sprint(args), "--resume"))
+	s.appendTermLine("system", fmt.Sprintf("[session:%s] spawning turn %d (resume=%v)", s.Name, s.TurnCount+1, strings.Contains(fmt.Sprint(args), "--resume")))
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start: %w", err)
@@ -229,6 +370,9 @@ func (s *Session) runTurn(ctx context.Context, args []string, prompt string) (*T
 			continue
 		}
 		messages = append(messages, msg)
+
+		// Classify and buffer for terminal viewer
+		s.classifyTermLine(msg)
 	}
 
 	err = cmd.Wait()
@@ -241,17 +385,28 @@ func (s *Session) runTurn(ctx context.Context, args []string, prompt string) (*T
 		}
 	}
 
+	inTok, outTok := extractTokens(messages)
+
 	result := &TurnResult{
-		Output:   extractTextContent(messages),
-		CostUSD:  extractCost(messages),
-		Model:    extractModel(messages),
-		ExitCode: exitCode,
-		Duration: time.Since(start),
-		Messages: messages,
+		Output:       extractTextContent(messages),
+		CostUSD:      extractCost(messages),
+		Model:        extractModel(messages),
+		ExitCode:     exitCode,
+		Duration:     time.Since(start),
+		Messages:     messages,
+		InputTokens:  inTok,
+		OutputTokens: outTok,
 	}
 
 	log.Printf("[session:%s] turn %d done: cost=$%.4f, exit=%d, duration=%v",
 		s.Name, s.TurnCount+1, result.CostUSD, result.ExitCode, result.Duration.Round(time.Millisecond))
+
+	s.appendTermLine("system", fmt.Sprintf("[session:%s] turn %d done: exit=%d, duration=%v", s.Name, s.TurnCount+1, exitCode, time.Since(start).Round(time.Millisecond)))
+	if exitCode == 0 {
+		s.appendTermLine("system", fmt.Sprintf("[session:%s] state -> idle", s.Name))
+	} else {
+		s.appendTermLine("system", fmt.Sprintf("[session:%s] state -> crashed", s.Name))
+	}
 
 	if exitCode != 0 {
 		return result, fmt.Errorf("claude exited with code %d", exitCode)
@@ -394,6 +549,20 @@ func extractCost(messages []map[string]interface{}) float64 {
 		}
 	}
 	return 0
+}
+
+func extractTokens(messages []map[string]interface{}) (input, output int) {
+	for _, msg := range messages {
+		if usage, ok := msg["usage"].(map[string]interface{}); ok {
+			if in, ok := usage["input_tokens"].(float64); ok {
+				input += int(in)
+			}
+			if out, ok := usage["output_tokens"].(float64); ok {
+				output += int(out)
+			}
+		}
+	}
+	return
 }
 
 func extractModel(messages []map[string]interface{}) string {
