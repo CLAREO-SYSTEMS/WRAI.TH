@@ -61,7 +61,9 @@ func New() (*DB, error) {
 
 func (d *DB) Close() error {
 	d.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
-	d.reader.Close()
+	if d.reader != nil && d.reader != d.conn {
+		d.reader.Close()
+	}
 	return d.conn.Close()
 }
 
@@ -110,7 +112,7 @@ func NewReadOnly() (*DB, error) {
 
 	conn.SetMaxOpenConns(1)
 
-	return &DB{conn: conn, path: dbPath}, nil
+	return &DB{conn: conn, reader: conn, path: dbPath}, nil
 }
 
 // ensureColumns checks a table for missing columns and adds them via ALTER TABLE.
