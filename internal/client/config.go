@@ -75,6 +75,9 @@ type HumanConfig struct {
 
 type AgentConfig struct {
 	ProfileSlug     string   `yaml:"profile_slug"`
+	Role            string   `yaml:"role"`
+	ReportsTo       string   `yaml:"reports_to"`
+	IsExecutive     bool     `yaml:"is_executive"`
 	WorkDir         string   `yaml:"work_dir"`
 	Machine         string   `yaml:"machine"`
 	Pool            string   `yaml:"pool"`
