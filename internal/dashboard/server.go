@@ -1,5 +1,6 @@
 // Package dashboard serves the Mission Control web UI for the WRAI.TH client.
 // Exposes fleet state, agent control, and token stats via HTTP + WebSocket.
+// Supports remote agents on satellites via HTTP proxy.
 package dashboard
 
 import (
@@ -20,21 +21,23 @@ var staticFiles embed.FS
 
 // Server serves the Mission Control dashboard.
 type Server struct {
-	manager *client.Manager
-	config  *client.Config
-	tracker *monitor.Tracker
-	relay   *client.RelayClient
-	mux     *http.ServeMux
+	manager   *client.Manager
+	config    *client.Config
+	tracker   *monitor.Tracker
+	relay     *client.RelayClient
+	satClient *client.SatelliteClient
+	mux       *http.ServeMux
 }
 
 // NewServer creates a dashboard server.
 func NewServer(mgr *client.Manager, cfg *client.Config, tracker *monitor.Tracker, relay *client.RelayClient) *Server {
 	s := &Server{
-		manager: mgr,
-		config:  cfg,
-		tracker: tracker,
-		relay:   relay,
-		mux:     http.NewServeMux(),
+		manager:   mgr,
+		config:    cfg,
+		tracker:   tracker,
+		relay:     relay,
+		satClient: client.NewSatelliteClient(),
+		mux:       http.NewServeMux(),
 	}
 	s.registerRoutes()
 	return s
@@ -78,6 +81,18 @@ func (s *Server) handleFleet(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Merge satellite states
+	for machineName, sat := range s.config.Satellites {
+		remote, err := s.satClient.Status(sat)
+		if err != nil {
+			log.Printf("[dashboard] satellite %s unreachable: %v", machineName, err)
+			continue
+		}
+		for name, state := range remote {
+			states[name] = state
+		}
+	}
+
 	writeJSON(w, map[string]interface{}{
 		"agents":     states,
 		"total_cost": s.tracker.TotalCost(),
@@ -96,11 +111,17 @@ func (s *Server) handleCostsDaily(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	// Return safe subset of config (no tokens/secrets)
+	satNames := make([]string, 0, len(s.config.Satellites))
+	for name := range s.config.Satellites {
+		satNames = append(satNames, name)
+	}
+
 	writeJSON(w, map[string]interface{}{
-		"mode":    s.config.Mode,
-		"machine": s.config.Machine.Name,
-		"pools":   s.config.Pools,
-		"agents":  sanitizeAgentConfigs(s.config.Agents),
+		"mode":       s.config.Mode,
+		"machine":    s.config.Machine.Name,
+		"pools":      s.config.Pools,
+		"agents":     sanitizeAgentConfigs(s.config.Agents),
+		"satellites": satNames,
 		"discord": map[string]interface{}{
 			"enabled": s.config.Discord.Enabled,
 		},
@@ -127,10 +148,7 @@ func sanitizeAgentConfigs(agents map[string]client.AgentConfig) map[string]inter
 }
 
 // handleChat handles GET (fetch messages) and POST (send message) for agent chat.
-// GET /api/chat/{agent} — returns relay messages to/from this agent
-// POST /api/chat/{agent} — sends a message from "user" to the agent via relay
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
-	// Extract agent name from path: /api/chat/{agent}
 	agent := strings.TrimPrefix(r.URL.Path, "/api/chat/")
 	if agent == "" {
 		http.Error(w, "agent name required", http.StatusBadRequest)
@@ -153,14 +171,12 @@ func (s *Server) handleChatGet(w http.ResponseWriter, r *http.Request, agent str
 		return
 	}
 
-	// Fetch messages from relay inbox for this agent
 	messages, err := s.relay.GetInbox(agent, false)
 	if err != nil {
 		writeJSON(w, []interface{}{})
 		return
 	}
 
-	// Convert to chat format
 	chatMsgs := make([]map[string]interface{}, 0, len(messages))
 	for _, msg := range messages {
 		role := "agent"
@@ -200,20 +216,17 @@ func (s *Server) handleChatPost(w http.ResponseWriter, r *http.Request, agent st
 		return
 	}
 
-	// Determine message type
 	msgType := "notification"
 	if strings.HasSuffix(strings.TrimSpace(req.Content), "?") {
 		msgType = "question"
 	}
 
-	// Build subject from first few words
 	words := strings.Fields(req.Content)
 	subject := strings.Join(words, " ")
 	if len(words) > 6 {
 		subject = strings.Join(words[:6], " ") + "..."
 	}
 
-	// Send via relay: from "user" to the agent
 	if err := s.relay.SendMessage("user", agent, subject, req.Content, msgType, "P1"); err != nil {
 		log.Printf("[dashboard] send to %s failed: %v", agent, err)
 		http.Error(w, "send failed", http.StatusInternalServerError)
@@ -224,8 +237,8 @@ func (s *Server) handleChatPost(w http.ResponseWriter, r *http.Request, agent st
 }
 
 // handleSpawn handles POST /api/spawn — spawns or wakes an agent.
-// Body: {"agent": "cto", "machine": "clareo-station"}
-// If machine matches local, spawns directly. Otherwise returns error (remote spawn TBD).
+// For local agents: spawns directly via manager.
+// For remote agents: sends spawn command to the satellite via HTTP.
 func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -247,11 +260,10 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if machine is local
+	// Resolve target machine
 	localMachine := s.config.Machine.Name
 	targetMachine := req.Machine
 	if targetMachine == "" {
-		// Default to wherever the agent is configured
 		if agentCfg, ok := s.config.Agents[req.Agent]; ok {
 			targetMachine = agentCfg.Machine
 		} else {
@@ -260,19 +272,39 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if targetMachine != localMachine {
-		// Remote spawn — send a command via relay that the target manager will pick up
-		if s.relay != nil {
-			err := s.relay.SendMessage("user", req.Agent, "Spawn requested",
-				"Manual spawn from Mission Control dashboard", "notification", "P0")
-			if err != nil {
-				log.Printf("[dashboard] remote spawn %s failed: %v", req.Agent, err)
-				http.Error(w, "remote spawn failed", http.StatusInternalServerError)
-				return
-			}
-			writeJSON(w, map[string]string{"status": "sent", "note": "spawn signal sent to remote machine"})
+		// Remote spawn — send to satellite
+		satInfo, ok := s.config.Satellites[targetMachine]
+		if !ok {
+			http.Error(w, "no satellite configured for machine: "+targetMachine, http.StatusBadRequest)
 			return
 		}
-		http.Error(w, "cannot spawn on remote machine: relay not configured", http.StatusServiceUnavailable)
+		agentCfg, ok := s.config.Agents[req.Agent]
+		if !ok {
+			http.Error(w, "unknown agent: "+req.Agent, http.StatusNotFound)
+			return
+		}
+
+		// Station builds the boot prompt (it has relay access)
+		sessionCtx, _ := s.relay.GetSessionContext(req.Agent)
+		inbox, _ := s.relay.GetInbox(req.Agent, true)
+		prompt := client.BuildBootPrompt(req.Agent, agentCfg, sessionCtx, inbox)
+
+		spawnReq := client.SpawnRequest{
+			Name:         req.Agent,
+			Config:       agentCfg,
+			RelayURL:     s.config.Relay.URL,
+			RelayProject: s.config.Relay.Project,
+			Prompt:       prompt,
+			Reason:       "manual spawn from Mission Control",
+		}
+
+		if err := s.satClient.Spawn(satInfo, spawnReq); err != nil {
+			log.Printf("[dashboard] remote spawn %s on %s failed: %v", req.Agent, targetMachine, err)
+			http.Error(w, "remote spawn failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+
+		writeJSON(w, map[string]string{"status": "spawning", "machine": targetMachine})
 		return
 	}
 
@@ -287,9 +319,22 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAvailableAgents returns all configured agents with their assigned machines.
+// Includes satellite machines from config.
 func (s *Server) handleAvailableAgents(w http.ResponseWriter, r *http.Request) {
 	allAgents := s.manager.AllAgentConfigs()
 	states := s.manager.GetAllStates()
+
+	// Merge satellite states for accurate status
+	for machineName, sat := range s.config.Satellites {
+		remote, err := s.satClient.Status(sat)
+		if err != nil {
+			log.Printf("[dashboard] satellite %s unreachable for agent status: %v", machineName, err)
+			continue
+		}
+		for name, state := range remote {
+			states[name] = state
+		}
+	}
 
 	result := make([]map[string]interface{}, 0, len(allAgents))
 	for name, cfg := range allAgents {
@@ -306,13 +351,16 @@ func (s *Server) handleAvailableAgents(w http.ResponseWriter, r *http.Request) {
 		result = append(result, entry)
 	}
 
-	// Get unique machines
+	// Get unique machines: local + agent configs + satellites
 	machineSet := make(map[string]bool)
 	machineSet[s.config.Machine.Name] = true
 	for _, cfg := range allAgents {
 		if cfg.Machine != "" {
 			machineSet[cfg.Machine] = true
 		}
+	}
+	for name := range s.config.Satellites {
+		machineSet[name] = true
 	}
 	machines := make([]string, 0, len(machineSet))
 	for m := range machineSet {
@@ -327,8 +375,8 @@ func (s *Server) handleAvailableAgents(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleTerminal serves the terminal output for an agent.
-// GET /api/terminal/{agent} — returns buffered stream-json output as terminal lines
-// POST /api/terminal/{agent} — sends user message to agent (appends to terminal + sends via relay)
+// For local agents: returns from session buffer.
+// For remote agents: proxies to the satellite.
 func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request) {
 	agent := strings.TrimPrefix(r.URL.Path, "/api/terminal/")
 	if agent == "" {
@@ -338,12 +386,26 @@ func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case "GET":
+		// Try local session first
 		sess := s.manager.GetSession(agent)
-		if sess == nil {
-			writeJSON(w, []interface{}{})
+		if sess != nil {
+			writeJSON(w, sess.GetTerminalLines())
 			return
 		}
-		writeJSON(w, sess.GetTerminalLines())
+
+		// Try satellites
+		if agentCfg, ok := s.config.Agents[agent]; ok {
+			if satInfo, ok := s.config.Satellites[agentCfg.Machine]; ok {
+				lines, err := s.satClient.Terminal(satInfo, agent)
+				if err == nil {
+					writeJSON(w, lines)
+					return
+				}
+				log.Printf("[dashboard] satellite terminal %s failed: %v", agent, err)
+			}
+		}
+
+		writeJSON(w, []interface{}{})
 
 	case "POST":
 		body, err := io.ReadAll(r.Body)
@@ -359,12 +421,12 @@ func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Append to terminal buffer
+		// Append to terminal buffer (local only)
 		if sess := s.manager.GetSession(agent); sess != nil {
 			sess.AppendUserMessage(req.Content)
 		}
 
-		// Also send via relay to wake the agent
+		// Send via relay to wake the agent
 		if s.relay != nil {
 			words := strings.Fields(req.Content)
 			subject := strings.Join(words, " ")

@@ -2,6 +2,9 @@
 // This is the client binary — it connects to a running agent-relay server
 // and manages Claude subprocesses on this machine.
 //
+// Station mode: full manager + dashboard + discord bridge
+// Satellite mode: headless HTTP server that receives commands from the station
+//
 // Usage:
 //
 //	wraith                     # start with wraith.yaml in cwd
@@ -56,57 +59,11 @@ func main() {
 
 	log.Printf("[wraith] mode=%s machine=%s relay=%s", cfg.Mode, cfg.Machine.Name, cfg.Relay.URL)
 
-	// --- Create shared components ---
-	tracker := monitor.NewTracker(cfg.Machine.DownloadDir)
-
-	mgr := client.NewManager(cfg)
-	mgr.SetTracker(tracker)
-
-	relay := mgr.Relay()
-
 	// --- Signal handling ---
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// --- Start manager (SSE listener + health checks + initial inbox) ---
-	if err := mgr.Start(ctx); err != nil {
-		log.Fatalf("failed to start manager: %v", err)
-	}
-
-	// --- Start Discord bridge (station mode only) ---
-	var bot *discord.Bot
-	if cfg.IsStation() && cfg.Discord.Enabled && cfg.Discord.Token != "" {
-		sseClient := mgr.SSE()
-		bot, err = discord.NewBot(cfg, relay, sseClient)
-		if err != nil {
-			log.Printf("[wraith] failed to create discord bot: %v", err)
-		} else {
-			if err := bot.Start(); err != nil {
-				log.Printf("[wraith] failed to start discord bot: %v", err)
-				bot = nil
-			}
-		}
-	}
-
-	// --- Start dashboard HTTP server (station mode only) ---
-	var dashServer *http.Server
-	if cfg.IsStation() {
-		dash := dashboard.NewServer(mgr, cfg, tracker, relay)
-		dashAddr := fmt.Sprintf("%s:%d", cfg.Web.Host, cfg.Web.Port)
-		dashServer = &http.Server{
-			Addr:    dashAddr,
-			Handler: dash.Handler(),
-		}
-
-		go func() {
-			log.Printf("[wraith] Mission Control at http://%s", dashAddr)
-			if err := dashServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Printf("[wraith] dashboard server error: %v", err)
-			}
-		}()
-	} else {
-		log.Printf("[wraith] satellite mode — no dashboard")
-	}
+	tracker := monitor.NewTracker(cfg.Machine.DownloadDir)
 
 	// --- Periodic tracker save (every 5 minutes) ---
 	saveTicker := time.NewTicker(5 * time.Minute)
@@ -121,28 +78,99 @@ func main() {
 		}
 	}()
 
-	// --- Wait for shutdown signal ---
+	if cfg.IsSatellite() {
+		runSatellite(ctx, cfg, tracker)
+	} else {
+		runStation(ctx, cfg, tracker)
+	}
+
+	saveTicker.Stop()
+	log.Printf("[wraith] stopped")
+}
+
+// runStation runs the full station: manager + dashboard + discord.
+func runStation(ctx context.Context, cfg *client.Config, tracker *monitor.Tracker) {
+	mgr := client.NewManager(cfg)
+	mgr.SetTracker(tracker)
+
+	relay := mgr.Relay()
+
+	if err := mgr.Start(ctx); err != nil {
+		log.Fatalf("failed to start manager: %v", err)
+	}
+
+	// Discord bridge
+	var bot *discord.Bot
+	if cfg.Discord.Enabled && cfg.Discord.Token != "" {
+		sseClient := mgr.SSE()
+		var err error
+		bot, err = discord.NewBot(cfg, relay, sseClient)
+		if err != nil {
+			log.Printf("[wraith] failed to create discord bot: %v", err)
+		} else {
+			if err := bot.Start(); err != nil {
+				log.Printf("[wraith] failed to start discord bot: %v", err)
+				bot = nil
+			}
+		}
+	}
+
+	// Dashboard
+	dash := dashboard.NewServer(mgr, cfg, tracker, relay)
+	dashAddr := fmt.Sprintf("%s:%d", cfg.Web.Host, cfg.Web.Port)
+	dashServer := &http.Server{
+		Addr:    dashAddr,
+		Handler: dash.Handler(),
+	}
+
+	go func() {
+		log.Printf("[wraith] Mission Control at http://%s", dashAddr)
+		if err := dashServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("[wraith] dashboard server error: %v", err)
+		}
+	}()
+
+	// Wait for shutdown
 	<-ctx.Done()
 	log.Printf("[wraith] shutting down...")
 
-	saveTicker.Stop()
-
-	// Stop discord bot
 	if bot != nil {
 		bot.Stop()
 	}
 
-	// Stop manager (graceful: waits for running agents, saves state)
 	mgr.Stop()
 
-	// Shut down dashboard server
-	if dashServer != nil {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		dashServer.Shutdown(shutdownCtx)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	dashServer.Shutdown(shutdownCtx)
+}
+
+// runSatellite runs a headless satellite: HTTP API only, no SSE, no relay, no dashboard.
+func runSatellite(ctx context.Context, cfg *client.Config, tracker *monitor.Tracker) {
+	satServer := client.NewSatelliteServer(cfg, tracker, ctx)
+
+	satAddr := fmt.Sprintf("%s:%d", cfg.Web.Host, cfg.StdoutAPI.Port)
+	httpServer := &http.Server{
+		Addr:    satAddr,
+		Handler: satServer.Handler(),
 	}
 
-	log.Printf("[wraith] stopped")
+	go func() {
+		log.Printf("[wraith] satellite API at http://%s", satAddr)
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("[wraith] satellite server error: %v", err)
+		}
+	}()
+
+	// Wait for shutdown
+	<-ctx.Done()
+	log.Printf("[wraith] shutting down satellite...")
+
+	satServer.Stop()
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	httpServer.Shutdown(shutdownCtx)
 }
 
 // runInit generates a wraith.yaml scaffold in the current directory.
@@ -153,14 +181,12 @@ func runInit(args []string) {
 	machine := fs.String("machine", "", "machine name (default: hostname)")
 	fs.Parse(args)
 
-	// Derive project name from directory
 	if *project == "" {
 		cwd, _ := os.Getwd()
 		*project = strings.ToLower(filepath.Base(cwd))
 		*project = strings.ReplaceAll(*project, " ", "-")
 	}
 
-	// Derive machine name from hostname
 	if *machine == "" {
 		h, _ := os.Hostname()
 		if h == "" {
@@ -180,7 +206,7 @@ func runInit(args []string) {
 	config := fmt.Sprintf(`# WRAI.TH Fleet Manager Configuration
 # Generated by: wraith init --project %s
 
-mode: station  # "station" (runs relay+dashboard+discord) or "satellite" (manager only)
+mode: station  # "station" (runs relay+dashboard+discord) or "satellite" (headless executor)
 
 relay:
   url: %s
@@ -195,6 +221,10 @@ web:
   host: 0.0.0.0
   port: 8091
 
+# Satellite API port (satellite mode only — station sends commands here)
+stdout_api:
+  port: 8092
+
 # Discord bridge (station mode only)
 discord:
   enabled: false
@@ -203,9 +233,13 @@ discord:
   # channels:
   #   engineering: "channel-id"
 
-# Agent definitions
-# Each agent runs as a Claude subprocess managed by this machine.
-# Agents on other machines are visible but not spawned locally.
+# Remote satellites (station mode only)
+# satellites:
+#   remote-machine:
+#     host: "100.x.x.x"
+#     port: 8092
+
+# Agent definitions (station mode only — satellite receives configs from station)
 agents:
   cto:
     profile_slug: cto
@@ -220,30 +254,18 @@ agents:
     max_context_bytes: 16384
     interest_tags: [architecture, planning, coordination]
 
-  # Add more agents:
-  # backend:
-  #   profile_slug: backend-lead
-  #   role: "Backend engineer"
-  #   reports_to: cto
-  #   work_dir: %s
-  #   machine: %s
-  #   pool: engineering
-  #   model: sonnet
-  #   interest_tags: [backend, api, database]
-
 # Team pools (for team: broadcasts)
 pools:
   engineering:
     lead: cto
     members: []
-    # channel: "discord-channel-id"  # for Discord routing
 
 # SSE tuning
 sse:
   reconnect_delay_seconds: 3
   fallback_poll_seconds: 10
   health_check_interval_seconds: 30
-`, *project, *relay, *project, *machine, cwd, *machine, cwd, *machine)
+`, *project, *relay, *project, *machine, cwd, *machine)
 
 	if err := os.WriteFile(outPath, []byte(config), 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to write %s: %v\n", outPath, err)
