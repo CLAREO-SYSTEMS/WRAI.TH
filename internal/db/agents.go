@@ -62,25 +62,44 @@ func (d *DB) RegisterAgent(project, name, role, description string, reportsTo, p
 		return nil, false, fmt.Errorf("query agent: %w", err)
 	}
 
-	// Existing agent — this is a respawn
+	// Existing agent — this is a respawn.
+	// Only update fields that are non-empty to preserve existing hierarchy data
+	// when callers (e.g. wraith pre-registration) don't provide them.
+	if role != "" {
+		a.Role = role
+	}
+	if description != "" {
+		a.Description = description
+	}
+	if reportsTo != nil && *reportsTo != "" {
+		a.ReportsTo = reportsTo
+	}
+	if profileSlug != nil && *profileSlug != "" {
+		a.ProfileSlug = profileSlug
+	}
+	if isExecutive {
+		a.IsExecutive = true
+	}
+	if sessionID != nil {
+		a.SessionID = sessionID
+	}
+	if interestTags != "" && interestTags != "[]" {
+		a.InterestTags = interestTags
+	}
+	if maxContextBytes > 0 && maxContextBytes != 16384 {
+		a.MaxContextBytes = maxContextBytes
+	}
+	a.LastSeen = now
+	a.Status = "active"
+	a.DeactivatedAt = nil
+
 	_, err = d.conn.Exec(
 		"UPDATE agents SET role = ?, description = ?, last_seen = ?, reports_to = ?, profile_slug = ?, is_executive = ?, session_id = ?, interest_tags = ?, max_context_bytes = ?, status = 'active', deactivated_at = NULL WHERE name = ? AND project = ?",
-		role, description, now, reportsTo, profileSlug, isExecutive, sessionID, interestTags, maxContextBytes, name, project,
+		a.Role, a.Description, now, a.ReportsTo, a.ProfileSlug, a.IsExecutive, a.SessionID, a.InterestTags, a.MaxContextBytes, name, project,
 	)
 	if err != nil {
 		return nil, false, fmt.Errorf("update agent: %w", err)
 	}
-	a.Role = role
-	a.Description = description
-	a.LastSeen = now
-	a.ReportsTo = reportsTo
-	a.ProfileSlug = profileSlug
-	a.IsExecutive = isExecutive
-	a.SessionID = sessionID
-	a.InterestTags = interestTags
-	a.MaxContextBytes = maxContextBytes
-	a.Status = "active"
-	a.DeactivatedAt = nil
 	return &a, true, nil
 }
 
