@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 
 	"agent-relay/internal/client"
 	"agent-relay/internal/monitor"
@@ -27,17 +28,21 @@ type Server struct {
 	relay     *client.RelayClient
 	satClient *client.SatelliteClient
 	mux       *http.ServeMux
+
+	liveSatMu   sync.RWMutex
+	liveSatellites map[string]client.SatelliteInfo // auto-registered satellites
 }
 
 // NewServer creates a dashboard server.
 func NewServer(mgr *client.Manager, cfg *client.Config, tracker *monitor.Tracker, relay *client.RelayClient) *Server {
 	s := &Server{
-		manager:   mgr,
-		config:    cfg,
-		tracker:   tracker,
-		relay:     relay,
-		satClient: client.NewSatelliteClient(),
-		mux:       http.NewServeMux(),
+		manager:        mgr,
+		config:         cfg,
+		tracker:        tracker,
+		relay:          relay,
+		satClient:      client.NewSatelliteClient(),
+		mux:            http.NewServeMux(),
+		liveSatellites: make(map[string]client.SatelliteInfo),
 	}
 	s.registerRoutes()
 	return s
@@ -58,6 +63,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/spawn", s.handleSpawn)
 	s.mux.HandleFunc("/api/agents/available", s.handleAvailableAgents)
 	s.mux.HandleFunc("/api/terminal/", s.handleTerminal)
+	s.mux.HandleFunc("/api/satellites/register", s.handleSatelliteRegister)
+	s.mux.HandleFunc("/api/satellites", s.handleListSatellites)
 
 	// Serve embedded static files
 	staticFS, err := fs.Sub(staticFiles, "static")
@@ -82,7 +89,7 @@ func (s *Server) handleFleet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Merge satellite states
-	for machineName, sat := range s.config.Satellites {
+	for machineName, sat := range s.allSatellites() {
 		remote, err := s.satClient.Status(sat)
 		if err != nil {
 			log.Printf("[dashboard] satellite %s unreachable: %v", machineName, err)
@@ -111,8 +118,8 @@ func (s *Server) handleCostsDaily(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	// Return safe subset of config (no tokens/secrets)
-	satNames := make([]string, 0, len(s.config.Satellites))
-	for name := range s.config.Satellites {
+	satNames := make([]string, 0, len(s.allSatellites()))
+	for name := range s.allSatellites() {
 		satNames = append(satNames, name)
 	}
 
@@ -273,7 +280,7 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 
 	if targetMachine != localMachine {
 		// Remote spawn — send to satellite
-		satInfo, ok := s.config.Satellites[targetMachine]
+		satInfo, ok := s.allSatellites()[targetMachine]
 		if !ok {
 			http.Error(w, "no satellite configured for machine: "+targetMachine, http.StatusBadRequest)
 			return
@@ -325,7 +332,7 @@ func (s *Server) handleAvailableAgents(w http.ResponseWriter, r *http.Request) {
 	states := s.manager.GetAllStates()
 
 	// Merge satellite states for accurate status
-	for machineName, sat := range s.config.Satellites {
+	for machineName, sat := range s.allSatellites() {
 		remote, err := s.satClient.Status(sat)
 		if err != nil {
 			log.Printf("[dashboard] satellite %s unreachable for agent status: %v", machineName, err)
@@ -359,7 +366,7 @@ func (s *Server) handleAvailableAgents(w http.ResponseWriter, r *http.Request) {
 			machineSet[cfg.Machine] = true
 		}
 	}
-	for name := range s.config.Satellites {
+	for name := range s.allSatellites() {
 		machineSet[name] = true
 	}
 	machines := make([]string, 0, len(machineSet))
@@ -395,7 +402,7 @@ func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request) {
 
 		// Try satellites
 		if agentCfg, ok := s.config.Agents[agent]; ok {
-			if satInfo, ok := s.config.Satellites[agentCfg.Machine]; ok {
+			if satInfo, ok := s.allSatellites()[agentCfg.Machine]; ok {
 				lines, err := s.satClient.Terminal(satInfo, agent)
 				if err == nil {
 					writeJSON(w, lines)
@@ -445,6 +452,78 @@ func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// allSatellites merges config-defined and auto-registered satellites.
+func (s *Server) allSatellites() map[string]client.SatelliteInfo {
+	merged := make(map[string]client.SatelliteInfo)
+	for name, sat := range s.allSatellites() {
+		merged[name] = sat
+	}
+	s.liveSatMu.RLock()
+	for name, sat := range s.liveSatellites {
+		merged[name] = sat
+	}
+	s.liveSatMu.RUnlock()
+	return merged
+}
+
+// handleSatelliteRegister handles POST /api/satellites/register.
+// Satellites call this on startup to announce themselves.
+func (s *Server) handleSatelliteRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		Name string `json:"name"`
+		Host string `json:"host"`
+		Port int    `json:"port"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil || req.Name == "" || req.Port == 0 {
+		http.Error(w, "name and port required", http.StatusBadRequest)
+		return
+	}
+
+	// If host is empty, use the request's remote address
+	if req.Host == "" {
+		req.Host = strings.Split(r.RemoteAddr, ":")[0]
+	}
+
+	s.liveSatMu.Lock()
+	s.liveSatellites[req.Name] = client.SatelliteInfo{Host: req.Host, Port: req.Port}
+	s.liveSatMu.Unlock()
+
+	log.Printf("[dashboard] satellite registered: %s at %s:%d", req.Name, req.Host, req.Port)
+	writeJSON(w, map[string]string{"status": "registered", "name": req.Name})
+}
+
+// handleListSatellites returns all known satellites (config + live).
+func (s *Server) handleListSatellites(w http.ResponseWriter, r *http.Request) {
+	all := s.allSatellites()
+	result := make([]map[string]interface{}, 0, len(all))
+	for name, sat := range all {
+		entry := map[string]interface{}{
+			"name": name,
+			"host": sat.Host,
+			"port": sat.Port,
+		}
+		// Check health
+		if err := s.satClient.Health(sat); err == nil {
+			entry["status"] = "online"
+		} else {
+			entry["status"] = "offline"
+		}
+		result = append(result, entry)
+	}
+	writeJSON(w, result)
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {

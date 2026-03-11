@@ -15,6 +15,7 @@ import (
 type Config struct {
 	Mode       string                    `yaml:"mode"`       // "station" or "satellite"
 	Relay      RelayConfig               `yaml:"relay"`
+	Station    StationConfig             `yaml:"station"`    // satellite-only: URL of the station to register with
 	Machine    MachineConfig             `yaml:"machine"`
 	Web        WebConfig                 `yaml:"web"`
 	StdoutAPI  StdoutAPIConfig           `yaml:"stdout_api"`
@@ -25,6 +26,10 @@ type Config struct {
 	Agents     map[string]AgentConfig    `yaml:"agents"`
 	SSE        SSEConfig                 `yaml:"sse"`
 	Tokens     TokenConfig               `yaml:"tokens"`
+}
+
+type StationConfig struct {
+	URL string `yaml:"url"` // e.g. "http://100.66.244.118:8091"
 }
 
 type RelayConfig struct {
