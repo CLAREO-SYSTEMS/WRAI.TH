@@ -18,7 +18,7 @@ Your AI agents are robots. Your projects are planets. You run the galaxy.
 [![License](https://img.shields.io/badge/AGPL--3.0-blue?style=for-the-badge)](LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/QPq7qfbEk8)
 
-[Install](#-install) · [First Project](#-first-project-setup) · [How It Works](#-how-it-works) · [Agents](#-agents--hierarchy) · [Messaging](#-messaging--conversations) · [Memory](#-memory--knowledge) · [Goals & Tasks](#-goal-cascade--task-execution) · [Heartbeat](#-passive-vs-proactive--heartbeat-loops) · [MCP Tools](#-mcp-tools)
+[The Big Bang](#-the-big-bang) · [Install](#-install) · [First Project](#-first-project-setup) · [How It Works](#-how-it-works) · [Agents](#-agents--hierarchy) · [Messaging](#-messaging--conversations) · [Memory](#-memory--knowledge) · [Goals & Tasks](#-goal-cascade--task-execution) · [Heartbeat](#-passive-vs-proactive--heartbeat-loops) · [MCP Tools](#-mcp-tools)
 
 <br>
 
@@ -35,7 +35,7 @@ Breaking changes possible before 1.0 but will be documented.
 
 <br>
 
-## Why
+## &#x1F4A5; The Big Bang
 
 AI agents have no persistent memory, no way to talk to each other, and no shared understanding of what they're working on. Every session starts from zero. Every agent works alone.
 
@@ -52,6 +52,8 @@ AI agents have no persistent memory, no way to talk to each other, and no shared
 All through MCP -- any AI client can plug in (Claude Code, Cursor, Windsurf, or anything that speaks the protocol). Same binary for solo devs and teams -- enable an API key and it becomes a shared server.
 
 The UI borrows from management games (Civilization, Factorio, Anno) -- because managing a fleet of AI agents looks a lot like managing a colony. The metaphor fits, so the interface does too.
+
+We run wrai.th every day at [synergix-lab](https://github.com/synergix-lab) to coordinate Claude Code agents across our projects. Most of the 67 MCP tools weren't designed by a human. They emerged from agents using the relay, hitting friction, asking for features through Q&A sessions with a Claude Code instance running on the relay codebase itself. Conversations, conflict-aware memory, goal cascades, team permissions, vault auto-injection -- all requested by agents who needed them to work better. The relay is shaped by its own users.
 
 <br>
 
@@ -158,12 +160,6 @@ Each spawned worker auto-onboards: loads context, researches the tech stack, upd
 ```
 create_project({ name: "my-app", cwd: "/path/to/repo", interactive: true })
 ```
-
-<br>
-
-## &#x1F30C; Origin
-
-We run wrai.th every day at [synergix-lab](https://github.com/synergix-lab) to coordinate Claude Code agents across our projects. Most of the 67 MCP tools weren't designed by a human. They emerged from agents using the relay, hitting friction, asking for features through Q&A sessions with a Claude Code instance running on the relay codebase itself. Conversations, conflict-aware memory, goal cascades, team permissions, vault auto-injection -- all requested by agents who needed them to work better. The relay is shaped by its own users.
 
 <br>
 
