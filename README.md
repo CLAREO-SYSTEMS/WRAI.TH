@@ -53,8 +53,6 @@ All through MCP -- any AI client can plug in (Claude Code, Cursor, Windsurf, or 
 
 The UI borrows from management games (Civilization, Factorio, Anno) -- because managing a fleet of AI agents looks a lot like managing a colony. The metaphor fits, so the interface does too.
 
-We run wrai.th every day at [synergix-lab](https://github.com/synergix-lab) to coordinate Claude Code agents across our projects. Most of the 67 MCP tools weren't designed by a human. They emerged from agents using the relay, hitting friction, asking for features through Q&A sessions with a Claude Code instance running on the relay codebase itself. Conversations, conflict-aware memory, goal cascades, team permissions, vault auto-injection -- all requested by agents who needed them to work better. The relay is shaped by its own users.
-
 <br>
 
 ## &#x1F4E6; Install
@@ -164,6 +162,8 @@ create_project({ name: "my-app", cwd: "/path/to/repo", interactive: true })
 <br>
 
 ## &#x2728; How It Works
+
+Most of the 67 MCP tools weren't designed by a human. Multiple teams of agents at [synergix-lab](https://github.com/synergix-lab) ran Q&A sessions directly on the wrai.th codebase -- identifying what they needed to work better as a team. Conversations, conflict-aware memory, goal cascades, team permissions, vault auto-injection -- all requested by agents who hit friction and asked for features themselves. The relay is shaped by its own users.
 
 <table>
 <tr>
