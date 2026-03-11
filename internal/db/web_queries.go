@@ -19,7 +19,7 @@ func (d *DB) ListAllConversations(project string) ([]models.ConversationWithMemb
 	if err != nil {
 		return nil, fmt.Errorf("list all conversations: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var convs []models.ConversationWithMembers
 	for rows.Next() {
@@ -82,11 +82,11 @@ func (d *DB) GetMessagesSince(project, since string, limit int) ([]models.Messag
 
 // ListAllAgents returns all agents across all projects, ordered by project then name.
 func (d *DB) ListAllAgents() ([]models.Agent, error) {
-	rows, err := d.ro().Query("SELECT "+agentColumns+" FROM agents WHERE status IN ('active', 'sleeping', 'inactive') ORDER BY project, name")
+	rows, err := d.ro().Query("SELECT " + agentColumns + " FROM agents WHERE status IN ('active', 'sleeping', 'inactive') ORDER BY project, name")
 	if err != nil {
 		return nil, fmt.Errorf("list all agents: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var agents []models.Agent
 	for rows.Next() {
@@ -144,7 +144,7 @@ func (d *DB) ListAllConversationsAcrossProjects() ([]models.ConversationWithMemb
 	if err != nil {
 		return nil, fmt.Errorf("list all conversations across projects: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var convs []models.ConversationWithMembers
 	for rows.Next() {
@@ -186,7 +186,7 @@ func (d *DB) ListProjects() ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list projects: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var projects []string
 	for rows.Next() {
