@@ -162,6 +162,11 @@ func runSatellite(ctx context.Context, cfg *client.Config, tracker *monitor.Trac
 		}
 	}()
 
+	// Register with station
+	if err := satServer.RegisterWithStation(); err != nil {
+		log.Printf("[wraith] station registration failed: %v (will retry when station comes online)", err)
+	}
+
 	// Wait for shutdown
 	<-ctx.Done()
 	log.Printf("[wraith] shutting down satellite...")

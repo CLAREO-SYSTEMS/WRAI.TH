@@ -5,6 +5,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -31,6 +32,8 @@ type SpawnRequest struct {
 // SatelliteServer is the HTTP server that runs on satellite machines.
 type SatelliteServer struct {
 	machineName string
+	stationURL  string
+	apiPort     int
 	sessions    map[string]*Session
 	tracker     *monitor.Tracker
 	mu          sync.RWMutex
@@ -42,6 +45,8 @@ type SatelliteServer struct {
 func NewSatelliteServer(cfg *Config, tracker *monitor.Tracker, ctx context.Context) *SatelliteServer {
 	s := &SatelliteServer{
 		machineName: cfg.Machine.Name,
+		stationURL:  cfg.Station.URL,
+		apiPort:     cfg.StdoutAPI.Port,
 		sessions:    make(map[string]*Session),
 		tracker:     tracker,
 		mux:         http.NewServeMux(),
@@ -49,6 +54,35 @@ func NewSatelliteServer(cfg *Config, tracker *monitor.Tracker, ctx context.Conte
 	}
 	s.registerRoutes()
 	return s
+}
+
+// RegisterWithStation announces this satellite to the station.
+// Called once on startup. The station stores it in its live registry.
+func (s *SatelliteServer) RegisterWithStation() error {
+	if s.stationURL == "" {
+		return fmt.Errorf("no station URL configured")
+	}
+
+	payload, _ := json.Marshal(map[string]interface{}{
+		"name": s.machineName,
+		"port": s.apiPort,
+		// host is omitted — station infers from request remote addr
+	})
+
+	url := strings.TrimRight(s.stationURL, "/") + "/api/satellites/register"
+	resp, err := http.Post(url, "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("station unreachable at %s: %w", s.stationURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("station registration failed (HTTP %d): %s", resp.StatusCode, string(body))
+	}
+
+	log.Printf("[satellite] registered with station at %s", s.stationURL)
+	return nil
 }
 
 // Handler returns the HTTP handler.
