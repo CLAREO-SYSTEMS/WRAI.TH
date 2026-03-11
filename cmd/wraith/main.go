@@ -64,8 +64,6 @@ func main() {
 
 	relay := mgr.Relay()
 
-	dash := dashboard.NewServer(mgr, cfg, tracker, relay)
-
 	// --- Signal handling ---
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -90,19 +88,25 @@ func main() {
 		}
 	}
 
-	// --- Start dashboard HTTP server ---
-	dashAddr := fmt.Sprintf("%s:%d", cfg.Web.Host, cfg.Web.Port)
-	dashServer := &http.Server{
-		Addr:    dashAddr,
-		Handler: dash.Handler(),
-	}
-
-	go func() {
-		log.Printf("[wraith] Mission Control at http://%s", dashAddr)
-		if err := dashServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("[wraith] dashboard server error: %v", err)
+	// --- Start dashboard HTTP server (station mode only) ---
+	var dashServer *http.Server
+	if cfg.IsStation() {
+		dash := dashboard.NewServer(mgr, cfg, tracker, relay)
+		dashAddr := fmt.Sprintf("%s:%d", cfg.Web.Host, cfg.Web.Port)
+		dashServer = &http.Server{
+			Addr:    dashAddr,
+			Handler: dash.Handler(),
 		}
-	}()
+
+		go func() {
+			log.Printf("[wraith] Mission Control at http://%s", dashAddr)
+			if err := dashServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("[wraith] dashboard server error: %v", err)
+			}
+		}()
+	} else {
+		log.Printf("[wraith] satellite mode — no dashboard")
+	}
 
 	// --- Periodic tracker save (every 5 minutes) ---
 	saveTicker := time.NewTicker(5 * time.Minute)
@@ -132,9 +136,11 @@ func main() {
 	mgr.Stop()
 
 	// Shut down dashboard server
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	dashServer.Shutdown(shutdownCtx)
+	if dashServer != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		dashServer.Shutdown(shutdownCtx)
+	}
 
 	log.Printf("[wraith] stopped")
 }
