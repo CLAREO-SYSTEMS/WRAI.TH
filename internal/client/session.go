@@ -73,6 +73,7 @@ type Session struct {
 	SessionID string
 	State     SessionState
 	Config    AgentConfig
+	RunningOn string // machine where the agent is currently running (set at spawn, cleared on stop)
 
 	TurnCount    int
 	LastCost     float64

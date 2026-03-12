@@ -54,6 +54,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/config", s.handleConfig)
 	s.mux.HandleFunc("/api/chat/", s.handleChat)
 	s.mux.HandleFunc("/api/spawn", s.handleSpawn)
+	s.mux.HandleFunc("/api/stop", s.handleStop)
 	s.mux.HandleFunc("/api/agents/available", s.handleAvailableAgents)
 	s.mux.HandleFunc("/api/terminal/", s.handleTerminal)
 	s.mux.HandleFunc("/api/satellites/register", s.handleSatelliteRegister)
@@ -275,6 +276,36 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"status": "spawning"})
 }
 
+// handleStop handles POST /api/stop — kills an agent wherever it's running.
+func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		Agent string `json:"agent"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil || req.Agent == "" {
+		http.Error(w, "agent name required", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.manager.StopAgent(req.Agent); err != nil {
+		log.Printf("[dashboard] stop %s failed: %v", req.Agent, err)
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+
+	writeJSON(w, map[string]string{"status": "stopped"})
+}
+
 // handleAvailableAgents returns all configured agents with their assigned machines.
 // Includes satellite machines from config.
 func (s *Server) handleAvailableAgents(w http.ResponseWriter, r *http.Request) {
@@ -296,14 +327,14 @@ func (s *Server) handleAvailableAgents(w http.ResponseWriter, r *http.Request) {
 	result := make([]map[string]interface{}, 0, len(allAgents))
 	for name, cfg := range allAgents {
 		entry := map[string]interface{}{
-			"name":    name,
-			"machine": cfg.Machine,
-			"pool":    cfg.Pool,
-			"model":   cfg.Model,
-			"state":   "unconfigured",
+			"name":  name,
+			"pool":  cfg.Pool,
+			"model": cfg.Model,
+			"state": "unconfigured",
 		}
 		if st, ok := states[name]; ok {
 			entry["state"] = st["state"]
+			entry["machine"] = st["machine"] // where it's currently running
 		}
 		result = append(result, entry)
 	}
@@ -343,9 +374,15 @@ func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case "GET":
-		// For remote agents, proxy to satellite (they have the real subprocess)
-		if agentCfg, ok := s.config.Agents[agent]; ok && agentCfg.Machine != s.config.Machine.Name {
-			if satInfo, ok := s.allSatellites()[agentCfg.Machine]; ok {
+		sess := s.manager.GetSession(agent)
+		if sess == nil {
+			writeJSON(w, []interface{}{})
+			return
+		}
+
+		// If running on a satellite, proxy to it
+		if sess.RunningOn != "" && sess.RunningOn != s.config.Machine.Name {
+			if satInfo, ok := s.allSatellites()[sess.RunningOn]; ok {
 				lines, err := s.manager.SatClient().Terminal(satInfo, agent)
 				if err == nil {
 					writeJSON(w, lines)
@@ -353,18 +390,10 @@ func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request) {
 				}
 				log.Printf("[dashboard] satellite terminal %s failed: %v", agent, err)
 			}
-			writeJSON(w, []interface{}{})
-			return
 		}
 
-		// Local agent — use session buffer
-		sess := s.manager.GetSession(agent)
-		if sess != nil {
-			writeJSON(w, sess.GetTerminalLines())
-			return
-		}
-
-		writeJSON(w, []interface{}{})
+		// Local or no satellite — use session buffer
+		writeJSON(w, sess.GetTerminalLines())
 
 	case "POST":
 		body, err := io.ReadAll(r.Body)
