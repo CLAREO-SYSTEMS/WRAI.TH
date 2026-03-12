@@ -19,13 +19,18 @@ const (
 	backoffMax      = 60 * time.Second
 )
 
-// Manager orchestrates all agent sessions on this machine.
+// Manager orchestrates all agent sessions across local and satellite machines.
 // Listens to relay SSE events and spawns/wakes agents as needed.
+// For remote agents, commands are forwarded to satellites via HTTP.
 type Manager struct {
 	config   *Config
 	relay    *RelayClient
 	sse      *SSEClient
 	sessions map[string]*Session
+
+	satClient      *SatelliteClient
+	liveSatellites map[string]SatelliteInfo
+	satMu          sync.RWMutex
 
 	tracker *monitor.Tracker
 
@@ -35,21 +40,30 @@ type Manager struct {
 }
 
 // NewManager creates a fleet manager from config.
+// Creates sessions for ALL agents (local + remote) so SSE events are handled uniformly.
 func NewManager(cfg *Config) *Manager {
 	relay := NewRelayClient(cfg.Relay)
 
 	m := &Manager{
-		config:   cfg,
-		relay:    relay,
-		sessions: make(map[string]*Session),
+		config:         cfg,
+		relay:          relay,
+		sessions:       make(map[string]*Session),
+		satClient:      NewSatelliteClient(),
+		liveSatellites: make(map[string]SatelliteInfo),
 	}
 
-	// Create sessions for local agents
-	for name, agentCfg := range cfg.LocalAgents() {
+	// Create sessions for ALL agents — local and remote.
+	// The manager tracks state for every agent; execution is routed
+	// to the correct machine (local subprocess or satellite HTTP) at spawn time.
+	for name, agentCfg := range cfg.Agents {
 		s := NewSession(name, agentCfg)
 		s.SetRelay(cfg.Relay.URL, cfg.Relay.Project)
 		m.sessions[name] = s
-		log.Printf("[manager] registered %s (machine=%s)", name, cfg.Machine.Name)
+		location := "local"
+		if agentCfg.Machine != cfg.Machine.Name {
+			location = "satellite:" + agentCfg.Machine
+		}
+		log.Printf("[manager] registered %s (%s)", name, location)
 	}
 
 	// Restore session IDs from previous run (enables --resume after redeploy)
@@ -104,7 +118,18 @@ func (m *Manager) Start(ctx context.Context) error {
 	// Initial inbox check — catch messages missed while offline
 	go m.initialInboxCheck()
 
-	log.Printf("[manager] started with %d local agents", len(m.sessions))
+	// Count local vs remote
+	localCount, remoteCount := 0, 0
+	m.mu.RLock()
+	for _, s := range m.sessions {
+		if m.isLocalAgent(s.Name) {
+			localCount++
+		} else {
+			remoteCount++
+		}
+	}
+	m.mu.RUnlock()
+	log.Printf("[manager] started with %d local + %d remote agents", localCount, remoteCount)
 	return nil
 }
 
@@ -202,13 +227,17 @@ func (m *Manager) GetAllStates() map[string]map[string]interface{} {
 
 	states := make(map[string]map[string]interface{})
 	for name, s := range m.sessions {
+		machine := s.Config.Machine
+		if machine == "" {
+			machine = m.config.Machine.Name
+		}
 		states[name] = map[string]interface{}{
 			"state":       s.GetState().String(),
 			"turn_count":  s.TurnCount,
 			"last_cost":   s.LastCost,
 			"crash_count": s.CrashCount,
 			"session_id":  s.SessionID,
-			"machine":     m.config.Machine.Name,
+			"machine":     machine,
 		}
 		if m.tracker != nil {
 			inTok, outTok := m.tracker.AgentTokens(name)
@@ -247,6 +276,55 @@ func (m *Manager) AllAgentConfigs() map[string]AgentConfig {
 // MachineName returns the local machine name.
 func (m *Manager) MachineName() string {
 	return m.config.Machine.Name
+}
+
+// isLocalAgent returns true if the agent runs on this machine.
+func (m *Manager) isLocalAgent(name string) bool {
+	cfg, ok := m.config.Agents[name]
+	if !ok {
+		return true // unknown agents default to local
+	}
+	return cfg.Machine == "" || cfg.Machine == m.config.Machine.Name
+}
+
+// RegisterSatellite adds or updates a live satellite in the registry.
+func (m *Manager) RegisterSatellite(name string, info SatelliteInfo) {
+	m.satMu.Lock()
+	m.liveSatellites[name] = info
+	m.satMu.Unlock()
+	log.Printf("[manager] satellite registered: %s at %s:%d", name, info.Host, info.Port)
+}
+
+// AllSatellites returns merged config + live satellites.
+func (m *Manager) AllSatellites() map[string]SatelliteInfo {
+	merged := make(map[string]SatelliteInfo)
+	for name, sat := range m.config.Satellites {
+		merged[name] = sat
+	}
+	m.satMu.RLock()
+	for name, sat := range m.liveSatellites {
+		merged[name] = sat
+	}
+	m.satMu.RUnlock()
+	return merged
+}
+
+// resolveSatellite returns the SatelliteInfo for a machine name.
+func (m *Manager) resolveSatellite(machineName string) (SatelliteInfo, bool) {
+	// Check config first
+	if sat, ok := m.config.Satellites[machineName]; ok {
+		return sat, true
+	}
+	// Check live registry
+	m.satMu.RLock()
+	sat, ok := m.liveSatellites[machineName]
+	m.satMu.RUnlock()
+	return sat, ok
+}
+
+// SatClient returns the satellite HTTP client.
+func (m *Manager) SatClient() *SatelliteClient {
+	return m.satClient
 }
 
 // --- SSE Event Handlers ---
@@ -386,14 +464,18 @@ func (m *Manager) onRegister(evt SSEEvent) {
 	m.mu.RUnlock()
 
 	if !exists {
-		// Dynamic agent discovery — check if this agent should run on our machine
-		if agentCfg, ok := m.config.Agents[agentName]; ok && agentCfg.Machine == m.config.Machine.Name {
+		// Dynamic agent discovery — add session for any configured agent (local or remote)
+		if agentCfg, ok := m.config.Agents[agentName]; ok {
 			m.mu.Lock()
 			s := NewSession(agentName, agentCfg)
 			s.SetRelay(m.config.Relay.URL, m.config.Relay.Project)
 			m.sessions[agentName] = s
 			m.mu.Unlock()
-			log.Printf("[manager] discovered new agent %s for this machine", agentName)
+			location := "local"
+			if agentCfg.Machine != m.config.Machine.Name {
+				location = "satellite:" + agentCfg.Machine
+			}
+			log.Printf("[manager] discovered new agent %s (%s)", agentName, location)
 		}
 	}
 }
@@ -410,7 +492,13 @@ func (m *Manager) spawnOrWake(s *Session, reason string) {
 
 	log.Printf("[manager] waking %s: %s (state=%s)", s.Name, reason, state)
 
-	if state == StateIdle && s.TurnCount > 0 {
+	// Route to satellite for remote agents
+	if !m.isLocalAgent(s.Name) {
+		m.spawnOrWakeRemote(s, reason)
+		return
+	}
+
+	if (state == StateIdle || state == StateSleeping) && s.TurnCount > 0 {
 		// Already spawned before — resume
 		inbox, _ := m.relay.GetInbox(s.Name, true)
 		prompt := BuildWakePrompt(reason, inbox)
@@ -438,6 +526,49 @@ func (m *Manager) spawnOrWake(s *Session, reason string) {
 	if m.tracker != nil && result != nil {
 		m.tracker.Record(s.Name, result.Model, result.CostUSD, result.Duration, s.TurnCount, result.InputTokens, result.OutputTokens)
 	}
+}
+
+// spawnOrWakeRemote sends spawn/wake commands to a satellite for a remote agent.
+func (m *Manager) spawnOrWakeRemote(s *Session, reason string) {
+	machineName := s.Config.Machine
+	satInfo, ok := m.resolveSatellite(machineName)
+	if !ok {
+		log.Printf("[manager] no satellite found for machine %s (agent %s), skipping", machineName, s.Name)
+		return
+	}
+
+	isResume := s.TurnCount > 0
+
+	// Station builds the prompt (it has relay access, satellite doesn't)
+	var prompt string
+	if isResume {
+		inbox, _ := m.relay.GetInbox(s.Name, true)
+		prompt = BuildWakePrompt(reason, inbox)
+	} else {
+		sessionCtx, _ := m.relay.GetSessionContext(s.Name)
+		inbox, _ := m.relay.GetInbox(s.Name, true)
+		prompt = BuildBootPrompt(s.Name, s.Config, sessionCtx, inbox)
+	}
+
+	spawnReq := SpawnRequest{
+		Name:         s.Name,
+		Config:       s.Config,
+		RelayURL:     m.config.Relay.URL,
+		RelayProject: m.config.Relay.Project,
+		Prompt:       prompt,
+		Resume:       isResume,
+		Reason:       reason,
+	}
+
+	s.SetState(StateSpawning)
+
+	if err := m.satClient.Spawn(satInfo, spawnReq); err != nil {
+		log.Printf("[manager] remote spawn %s on %s failed: %v", s.Name, machineName, err)
+		s.SetState(StateSleeping)
+		return
+	}
+
+	log.Printf("[manager] remote spawn %s sent to satellite %s (resume=%v)", s.Name, machineName, isResume)
 }
 
 func (m *Manager) retryCrash(s *Session, prompt string, isResume bool) {

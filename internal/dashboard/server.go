@@ -11,7 +11,6 @@ import (
 	"log"
 	"net/http"
 	"strings"
-	"sync"
 
 	"agent-relay/internal/client"
 	"agent-relay/internal/monitor"
@@ -26,23 +25,17 @@ type Server struct {
 	config    *client.Config
 	tracker   *monitor.Tracker
 	relay     *client.RelayClient
-	satClient *client.SatelliteClient
 	mux       *http.ServeMux
-
-	liveSatMu   sync.RWMutex
-	liveSatellites map[string]client.SatelliteInfo // auto-registered satellites
 }
 
 // NewServer creates a dashboard server.
 func NewServer(mgr *client.Manager, cfg *client.Config, tracker *monitor.Tracker, relay *client.RelayClient) *Server {
 	s := &Server{
-		manager:        mgr,
-		config:         cfg,
-		tracker:        tracker,
-		relay:          relay,
-		satClient:      client.NewSatelliteClient(),
-		mux:            http.NewServeMux(),
-		liveSatellites: make(map[string]client.SatelliteInfo),
+		manager: mgr,
+		config:  cfg,
+		tracker: tracker,
+		relay:   relay,
+		mux:     http.NewServeMux(),
 	}
 	s.registerRoutes()
 	return s
@@ -88,9 +81,9 @@ func (s *Server) handleFleet(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Merge satellite states
+	// Merge satellite states (satellite has real-time subprocess info)
 	for machineName, sat := range s.allSatellites() {
-		remote, err := s.satClient.Status(sat)
+		remote, err := s.manager.SatClient().Status(sat)
 		if err != nil {
 			log.Printf("[dashboard] satellite %s unreachable: %v", machineName, err)
 			continue
@@ -267,55 +260,7 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve target machine
-	localMachine := s.config.Machine.Name
-	targetMachine := req.Machine
-	if targetMachine == "" {
-		if agentCfg, ok := s.config.Agents[req.Agent]; ok {
-			targetMachine = agentCfg.Machine
-		} else {
-			targetMachine = localMachine
-		}
-	}
-
-	if targetMachine != localMachine {
-		// Remote spawn — send to satellite
-		satInfo, ok := s.allSatellites()[targetMachine]
-		if !ok {
-			http.Error(w, "no satellite configured for machine: "+targetMachine, http.StatusBadRequest)
-			return
-		}
-		agentCfg, ok := s.config.Agents[req.Agent]
-		if !ok {
-			http.Error(w, "unknown agent: "+req.Agent, http.StatusNotFound)
-			return
-		}
-
-		// Station builds the boot prompt (it has relay access)
-		sessionCtx, _ := s.relay.GetSessionContext(req.Agent)
-		inbox, _ := s.relay.GetInbox(req.Agent, true)
-		prompt := client.BuildBootPrompt(req.Agent, agentCfg, sessionCtx, inbox)
-
-		spawnReq := client.SpawnRequest{
-			Name:         req.Agent,
-			Config:       agentCfg,
-			RelayURL:     s.config.Relay.URL,
-			RelayProject: s.config.Relay.Project,
-			Prompt:       prompt,
-			Reason:       "manual spawn from Mission Control",
-		}
-
-		if err := s.satClient.Spawn(satInfo, spawnReq); err != nil {
-			log.Printf("[dashboard] remote spawn %s on %s failed: %v", req.Agent, targetMachine, err)
-			http.Error(w, "remote spawn failed: "+err.Error(), http.StatusBadGateway)
-			return
-		}
-
-		writeJSON(w, map[string]string{"status": "spawning", "machine": targetMachine})
-		return
-	}
-
-	// Local spawn
+	// Manager handles local vs remote routing transparently
 	if err := s.manager.SpawnAgent(req.Agent, "manual spawn from Mission Control"); err != nil {
 		log.Printf("[dashboard] spawn %s failed: %v", req.Agent, err)
 		http.Error(w, err.Error(), http.StatusConflict)
@@ -333,7 +278,7 @@ func (s *Server) handleAvailableAgents(w http.ResponseWriter, r *http.Request) {
 
 	// Merge satellite states for accurate status
 	for machineName, sat := range s.allSatellites() {
-		remote, err := s.satClient.Status(sat)
+		remote, err := s.manager.SatClient().Status(sat)
 		if err != nil {
 			log.Printf("[dashboard] satellite %s unreachable for agent status: %v", machineName, err)
 			continue
@@ -403,7 +348,7 @@ func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request) {
 		// Try satellites
 		if agentCfg, ok := s.config.Agents[agent]; ok {
 			if satInfo, ok := s.allSatellites()[agentCfg.Machine]; ok {
-				lines, err := s.satClient.Terminal(satInfo, agent)
+				lines, err := s.manager.SatClient().Terminal(satInfo, agent)
 				if err == nil {
 					writeJSON(w, lines)
 					return
@@ -454,18 +399,9 @@ func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// allSatellites merges config-defined and auto-registered satellites.
+// allSatellites delegates to the manager's satellite registry.
 func (s *Server) allSatellites() map[string]client.SatelliteInfo {
-	merged := make(map[string]client.SatelliteInfo)
-	for name, sat := range s.allSatellites() {
-		merged[name] = sat
-	}
-	s.liveSatMu.RLock()
-	for name, sat := range s.liveSatellites {
-		merged[name] = sat
-	}
-	s.liveSatMu.RUnlock()
-	return merged
+	return s.manager.AllSatellites()
 }
 
 // handleSatelliteRegister handles POST /api/satellites/register.
@@ -497,11 +433,8 @@ func (s *Server) handleSatelliteRegister(w http.ResponseWriter, r *http.Request)
 		req.Host = strings.Split(r.RemoteAddr, ":")[0]
 	}
 
-	s.liveSatMu.Lock()
-	s.liveSatellites[req.Name] = client.SatelliteInfo{Host: req.Host, Port: req.Port}
-	s.liveSatMu.Unlock()
-
-	log.Printf("[dashboard] satellite registered: %s at %s:%d", req.Name, req.Host, req.Port)
+	// Delegate to manager — single source of truth for satellites
+	s.manager.RegisterSatellite(req.Name, client.SatelliteInfo{Host: req.Host, Port: req.Port})
 	writeJSON(w, map[string]string{"status": "registered", "name": req.Name})
 }
 
@@ -516,7 +449,7 @@ func (s *Server) handleListSatellites(w http.ResponseWriter, r *http.Request) {
 			"port": sat.Port,
 		}
 		// Check health
-		if err := s.satClient.Health(sat); err == nil {
+		if err := s.manager.SatClient().Health(sat); err == nil {
 			entry["status"] = "online"
 		} else {
 			entry["status"] = "offline"

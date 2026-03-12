@@ -94,7 +94,7 @@ func NewSession(name string, cfg AgentConfig) *Session {
 	return &Session{
 		Name:      name,
 		SessionID: uuid.New().String(),
-		State:     StateIdle,
+		State:     StateSleeping,
 		Config:    cfg,
 	}
 }
