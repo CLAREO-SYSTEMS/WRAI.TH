@@ -59,11 +59,7 @@ func NewManager(cfg *Config) *Manager {
 		s := NewSession(name, agentCfg)
 		s.SetRelay(cfg.Relay.URL, cfg.Relay.Project)
 		m.sessions[name] = s
-		location := "local"
-		if agentCfg.Machine != cfg.Machine.Name {
-			location = "satellite:" + agentCfg.Machine
-		}
-		log.Printf("[manager] registered %s (%s)", name, location)
+		log.Printf("[manager] registered agent %s", name)
 	}
 
 	// Restore session IDs from previous run (enables --resume after redeploy)
@@ -118,18 +114,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	// Initial inbox check — catch messages missed while offline
 	go m.initialInboxCheck()
 
-	// Count local vs remote
-	localCount, remoteCount := 0, 0
-	m.mu.RLock()
-	for _, s := range m.sessions {
-		if m.isLocalAgent(s.Name) {
-			localCount++
-		} else {
-			remoteCount++
-		}
-	}
-	m.mu.RUnlock()
-	log.Printf("[manager] started with %d local + %d remote agents", localCount, remoteCount)
+	log.Printf("[manager] started with %d agents", len(m.sessions))
 	return nil
 }
 
@@ -227,17 +212,13 @@ func (m *Manager) GetAllStates() map[string]map[string]interface{} {
 
 	states := make(map[string]map[string]interface{})
 	for name, s := range m.sessions {
-		machine := s.Config.Machine
-		if machine == "" {
-			machine = m.config.Machine.Name
-		}
 		states[name] = map[string]interface{}{
 			"state":       s.GetState().String(),
 			"turn_count":  s.TurnCount,
 			"last_cost":   s.LastCost,
 			"crash_count": s.CrashCount,
 			"session_id":  s.SessionID,
-			"machine":     machine,
+			"machine":     s.RunningOn, // where it's currently running (empty = not deployed)
 		}
 		if m.tracker != nil {
 			inTok, outTok := m.tracker.AgentTokens(name)
@@ -248,10 +229,9 @@ func (m *Manager) GetAllStates() map[string]map[string]interface{} {
 	return states
 }
 
-// SpawnAgent triggers a spawn/wake for a named agent from external callers (e.g. dashboard).
-// machineOverride lets the caller force a target machine (e.g. from the UI machine selector).
-// If empty, uses the agent's configured machine.
-func (m *Manager) SpawnAgent(name, reason, machineOverride string) error {
+// SpawnAgent triggers a spawn/wake for a named agent.
+// machine is the target machine — required for first spawn, optional for wake (uses last known).
+func (m *Manager) SpawnAgent(name, reason, machine string) error {
 	m.mu.RLock()
 	s, ok := m.sessions[name]
 	m.mu.RUnlock()
@@ -265,21 +245,86 @@ func (m *Manager) SpawnAgent(name, reason, machineOverride string) error {
 	if state == StateDead {
 		return fmt.Errorf("agent %s is dead", name)
 	}
-	if machineOverride != "" {
-		go m.spawnOnMachine(s, reason, machineOverride)
-	} else {
-		go m.spawnOrWake(s, reason)
+
+	// Resolve target machine: explicit > last known > config default
+	if machine == "" {
+		machine = s.RunningOn
 	}
+	if machine == "" {
+		machine = s.Config.Machine
+	}
+	if machine == "" {
+		// No machine anywhere — can't spawn
+		return fmt.Errorf("no machine specified for agent %s", name)
+	}
+
+	go m.spawnOnMachine(s, reason, machine)
 	return nil
 }
 
-// spawnOnMachine spawns an agent on a specific machine, overriding config.
+// StopAgent kills an agent wherever it's running.
+func (m *Manager) StopAgent(name string) error {
+	m.mu.RLock()
+	s, ok := m.sessions[name]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("unknown agent: %s", name)
+	}
+
+	state := s.GetState()
+	if state == StateSleeping || state == StateDead {
+		return fmt.Errorf("agent %s is not running (state=%s)", name, state)
+	}
+
+	if m.isRunningLocally(s) {
+		// Kill local subprocess
+		s.Kill()
+		s.SetState(StateSleeping)
+		go m.relay.SleepAgent(name)
+		log.Printf("[manager] stopped local agent %s", name)
+	} else {
+		// Send stop to satellite
+		satInfo, ok := m.resolveSatellite(s.RunningOn)
+		if !ok {
+			return fmt.Errorf("satellite %s not found for agent %s", s.RunningOn, name)
+		}
+		if err := m.satClient.Stop(satInfo, name); err != nil {
+			return fmt.Errorf("satellite stop failed: %w", err)
+		}
+		s.SetState(StateSleeping)
+		go m.relay.SleepAgent(name)
+		log.Printf("[manager] stopped remote agent %s on %s", name, s.RunningOn)
+	}
+
+	return nil
+}
+
+// spawnOnMachine spawns an agent on a specific machine.
 func (m *Manager) spawnOnMachine(s *Session, reason, machine string) {
+	s.RunningOn = machine
 	if machine == m.config.Machine.Name {
-		m.spawnOrWake(s, reason)
+		m.spawnLocal(s, reason)
 		return
 	}
 	m.sendToSatellite(s, reason, machine)
+}
+
+// wakeAgent is used by SSE handlers to wake an agent on its last known machine.
+// If the agent has never been spawned (no RunningOn), it's skipped.
+func (m *Manager) wakeAgent(s *Session, reason string) {
+	machine := s.RunningOn
+	if machine == "" {
+		machine = s.Config.Machine // config default preference
+	}
+	if machine == "" {
+		log.Printf("[manager] %s has no machine assigned, skipping wake for: %s", s.Name, reason)
+		return
+	}
+	state := s.GetState()
+	if state == StateWorking || state == StateSpawning || state == StateDead {
+		return
+	}
+	m.spawnOnMachine(s, reason, machine)
 }
 
 // AllAgentConfigs returns the full agent config map (all machines).
@@ -292,13 +337,9 @@ func (m *Manager) MachineName() string {
 	return m.config.Machine.Name
 }
 
-// isLocalAgent returns true if the agent runs on this machine.
-func (m *Manager) isLocalAgent(name string) bool {
-	cfg, ok := m.config.Agents[name]
-	if !ok {
-		return true // unknown agents default to local
-	}
-	return cfg.Machine == "" || cfg.Machine == m.config.Machine.Name
+// isRunningLocally returns true if the agent is currently running on this machine.
+func (m *Manager) isRunningLocally(s *Session) bool {
+	return s.RunningOn == "" || s.RunningOn == m.config.Machine.Name
 }
 
 // RegisterSatellite adds or updates a live satellite in the registry.
@@ -371,7 +412,7 @@ func (m *Manager) onMessage(evt SSEEvent) {
 		defer m.mu.RUnlock()
 		for _, s := range m.sessions {
 			if shouldWakeBroadcast(s.GetState(), priority) {
-				go m.spawnOrWake(s, "broadcast from "+from+" ("+priority+")")
+				go m.wakeAgent(s, "broadcast from "+from+" ("+priority+")")
 			}
 		}
 		return
@@ -393,7 +434,7 @@ func (m *Manager) onMessage(evt SSEEvent) {
 	}
 
 	if shouldWakeDirect(s.GetState(), priority) {
-		go m.spawnOrWake(s, "message from "+from+" ("+priority+")")
+		go m.wakeAgent(s, "message from "+from+" ("+priority+")")
 	}
 }
 
@@ -417,7 +458,7 @@ func (m *Manager) onTask(evt SSEEvent) {
 	for name, s := range m.sessions {
 		if s.Config.ProfileSlug == target {
 			if shouldWakeTask(s.GetState(), priority) {
-				go m.spawnOrWake(s, "task dispatched to "+target+" ("+priority+")")
+				go m.wakeAgent(s, "task dispatched to "+target+" ("+priority+")")
 			}
 			_ = name
 			break
@@ -478,25 +519,21 @@ func (m *Manager) onRegister(evt SSEEvent) {
 	m.mu.RUnlock()
 
 	if !exists {
-		// Dynamic agent discovery — add session for any configured agent (local or remote)
 		if agentCfg, ok := m.config.Agents[agentName]; ok {
 			m.mu.Lock()
 			s := NewSession(agentName, agentCfg)
 			s.SetRelay(m.config.Relay.URL, m.config.Relay.Project)
 			m.sessions[agentName] = s
 			m.mu.Unlock()
-			location := "local"
-			if agentCfg.Machine != m.config.Machine.Name {
-				location = "satellite:" + agentCfg.Machine
-			}
-			log.Printf("[manager] discovered new agent %s (%s)", agentName, location)
+			log.Printf("[manager] discovered new agent %s", agentName)
 		}
 	}
 }
 
 // --- Spawn / Wake ---
 
-func (m *Manager) spawnOrWake(s *Session, reason string) {
+// spawnLocal runs a local Claude subprocess for the agent.
+func (m *Manager) spawnLocal(s *Session, reason string) {
 	state := s.GetState()
 
 	if s.CrashCount >= maxCrashRetries {
@@ -504,13 +541,7 @@ func (m *Manager) spawnOrWake(s *Session, reason string) {
 		return
 	}
 
-	log.Printf("[manager] waking %s: %s (state=%s)", s.Name, reason, state)
-
-	// Route to satellite for remote agents
-	if !m.isLocalAgent(s.Name) {
-		m.sendToSatellite(s, reason, s.Config.Machine)
-		return
-	}
+	log.Printf("[manager] spawning local %s: %s (state=%s)", s.Name, reason, state)
 
 	if (state == StateIdle || state == StateSleeping) && s.TurnCount > 0 {
 		// Already spawned before — resume
@@ -543,7 +574,6 @@ func (m *Manager) spawnOrWake(s *Session, reason string) {
 }
 
 // sendToSatellite sends spawn/wake commands to a satellite for a remote agent.
-// machineName can come from config (spawnOrWake) or UI override (spawnOnMachine).
 func (m *Manager) sendToSatellite(s *Session, reason, machineName string) {
 	satInfo, ok := m.resolveSatellite(machineName)
 	if !ok {
@@ -638,7 +668,7 @@ func (m *Manager) wakeTeamMembers(teamSlug, from, priority, msgType string) {
 		}
 		if s, ok := m.sessions[member]; ok {
 			if shouldWakeDirect(s.GetState(), priority) {
-				go m.spawnOrWake(s, "team:"+teamSlug+" from "+from+" ("+priority+")")
+				go m.wakeAgent(s, "team:"+teamSlug+" from "+from+" ("+priority+")")
 			}
 		}
 	}
@@ -690,7 +720,7 @@ func (m *Manager) initialInboxCheck() {
 
 		if len(messages) > 0 {
 			log.Printf("[manager] %s has %d pending messages, spawning", name, len(messages))
-			go m.spawnOrWake(s, "pending messages on startup")
+			go m.wakeAgent(s, "pending messages on startup")
 		}
 	}
 }
@@ -784,6 +814,7 @@ type savedState struct {
 type savedSession struct {
 	SessionID string `json:"session_id"`
 	TurnCount int    `json:"turn_count"`
+	RunningOn string `json:"running_on,omitempty"`
 }
 
 func (m *Manager) stateFilePath() string {
@@ -800,6 +831,7 @@ func (m *Manager) saveSessionState() {
 			state.Sessions[name] = savedSession{
 				SessionID: s.SessionID,
 				TurnCount: s.TurnCount,
+				RunningOn: s.RunningOn,
 			}
 		}
 	}
@@ -838,6 +870,7 @@ func (m *Manager) loadSessionState() {
 		if s, ok := m.sessions[name]; ok {
 			s.SessionID = saved.SessionID
 			s.TurnCount = saved.TurnCount
+			s.RunningOn = saved.RunningOn
 			s.SetState(StateSleeping) // was running before shutdown
 			restored++
 			log.Printf("[manager] restored session %s (id=%s, turns=%d)", name, saved.SessionID, saved.TurnCount)
