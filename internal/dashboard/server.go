@@ -233,6 +233,11 @@ func (s *Server) handleChatPost(w http.ResponseWriter, r *http.Request, agent st
 		return
 	}
 
+	// Explicitly wake the agent — don't rely solely on SSE event propagation
+	if err := s.manager.SpawnAgent(agent, "chat message from user", ""); err != nil {
+		log.Printf("[dashboard] wake %s after chat failed: %v (non-fatal)", agent, err)
+	}
+
 	writeJSON(w, map[string]string{"status": "sent"})
 }
 
@@ -260,8 +265,8 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Manager handles local vs remote routing transparently
-	if err := s.manager.SpawnAgent(req.Agent, "manual spawn from Mission Control"); err != nil {
+	// Manager handles local vs remote routing — pass machine override from UI
+	if err := s.manager.SpawnAgent(req.Agent, "manual spawn from Mission Control", req.Machine); err != nil {
 		log.Printf("[dashboard] spawn %s failed: %v", req.Agent, err)
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
