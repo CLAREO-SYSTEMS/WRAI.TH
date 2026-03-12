@@ -343,15 +343,8 @@ func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case "GET":
-		// Try local session first
-		sess := s.manager.GetSession(agent)
-		if sess != nil {
-			writeJSON(w, sess.GetTerminalLines())
-			return
-		}
-
-		// Try satellites
-		if agentCfg, ok := s.config.Agents[agent]; ok {
+		// For remote agents, proxy to satellite (they have the real subprocess)
+		if agentCfg, ok := s.config.Agents[agent]; ok && agentCfg.Machine != s.config.Machine.Name {
 			if satInfo, ok := s.allSatellites()[agentCfg.Machine]; ok {
 				lines, err := s.manager.SatClient().Terminal(satInfo, agent)
 				if err == nil {
@@ -360,6 +353,15 @@ func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request) {
 				}
 				log.Printf("[dashboard] satellite terminal %s failed: %v", agent, err)
 			}
+			writeJSON(w, []interface{}{})
+			return
+		}
+
+		// Local agent — use session buffer
+		sess := s.manager.GetSession(agent)
+		if sess != nil {
+			writeJSON(w, sess.GetTerminalLines())
+			return
 		}
 
 		writeJSON(w, []interface{}{})
@@ -383,7 +385,7 @@ func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request) {
 			sess.AppendUserMessage(req.Content)
 		}
 
-		// Send via relay to wake the agent
+		// Send via relay and wake the agent
 		if s.relay != nil {
 			words := strings.Fields(req.Content)
 			subject := strings.Join(words, " ")
@@ -395,6 +397,11 @@ func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request) {
 				msgType = "question"
 			}
 			_ = s.relay.SendMessage("user", agent, subject, req.Content, msgType, "P1")
+		}
+
+		// Explicitly wake the agent
+		if err := s.manager.SpawnAgent(agent, "terminal message from user", ""); err != nil {
+			log.Printf("[dashboard] wake %s after terminal msg failed: %v (non-fatal)", agent, err)
 		}
 
 		writeJSON(w, map[string]string{"status": "sent"})
