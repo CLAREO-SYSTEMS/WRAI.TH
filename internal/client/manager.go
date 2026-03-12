@@ -249,8 +249,9 @@ func (m *Manager) GetAllStates() map[string]map[string]interface{} {
 }
 
 // SpawnAgent triggers a spawn/wake for a named agent from external callers (e.g. dashboard).
-// Returns an error if the agent is unknown or already working.
-func (m *Manager) SpawnAgent(name, reason string) error {
+// machineOverride lets the caller force a target machine (e.g. from the UI machine selector).
+// If empty, uses the agent's configured machine.
+func (m *Manager) SpawnAgent(name, reason, machineOverride string) error {
 	m.mu.RLock()
 	s, ok := m.sessions[name]
 	m.mu.RUnlock()
@@ -264,8 +265,57 @@ func (m *Manager) SpawnAgent(name, reason string) error {
 	if state == StateDead {
 		return fmt.Errorf("agent %s is dead", name)
 	}
-	go m.spawnOrWake(s, reason)
+	if machineOverride != "" {
+		go m.spawnOnMachine(s, reason, machineOverride)
+	} else {
+		go m.spawnOrWake(s, reason)
+	}
 	return nil
+}
+
+// spawnOnMachine spawns an agent on a specific machine, overriding config.
+func (m *Manager) spawnOnMachine(s *Session, reason, machine string) {
+	if machine == m.config.Machine.Name {
+		// Local spawn
+		m.spawnOrWake(s, reason)
+		return
+	}
+
+	// Remote spawn on specified satellite
+	satInfo, ok := m.resolveSatellite(machine)
+	if !ok {
+		log.Printf("[manager] no satellite found for machine %s (agent %s), cannot spawn", machine, s.Name)
+		return
+	}
+
+	isResume := s.TurnCount > 0
+	var prompt string
+	if isResume {
+		inbox, _ := m.relay.GetInbox(s.Name, true)
+		prompt = BuildWakePrompt(reason, inbox)
+	} else {
+		sessionCtx, _ := m.relay.GetSessionContext(s.Name)
+		inbox, _ := m.relay.GetInbox(s.Name, true)
+		prompt = BuildBootPrompt(s.Name, s.Config, sessionCtx, inbox)
+	}
+
+	spawnReq := SpawnRequest{
+		Name:         s.Name,
+		Config:       s.Config,
+		RelayURL:     m.config.Relay.URL,
+		RelayProject: m.config.Relay.Project,
+		Prompt:       prompt,
+		Resume:       isResume,
+		Reason:       reason,
+	}
+
+	s.SetState(StateSpawning)
+	if err := m.satClient.Spawn(satInfo, spawnReq); err != nil {
+		log.Printf("[manager] remote spawn %s on %s failed: %v", s.Name, machine, err)
+		s.SetState(StateSleeping)
+		return
+	}
+	log.Printf("[manager] remote spawn %s sent to satellite %s (resume=%v)", s.Name, machine, isResume)
 }
 
 // AllAgentConfigs returns the full agent config map (all machines).
