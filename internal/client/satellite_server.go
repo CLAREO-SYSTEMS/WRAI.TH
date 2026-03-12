@@ -12,6 +12,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -34,6 +36,7 @@ type SatelliteServer struct {
 	machineName string
 	stationURL  string
 	apiPort     int
+	localWorkDir string // local working directory — overrides station's WorkDir in spawn requests
 	sessions    map[string]*Session
 	tracker     *monitor.Tracker
 	mu          sync.RWMutex
@@ -43,14 +46,27 @@ type SatelliteServer struct {
 
 // NewSatelliteServer creates a satellite HTTP server.
 func NewSatelliteServer(cfg *Config, tracker *monitor.Tracker, ctx context.Context) *SatelliteServer {
+	// Resolve local work directory: use download_dir from config, fall back to CWD
+	localWork := cfg.Machine.DownloadDir
+	if localWork == "" {
+		localWork, _ = os.Getwd()
+	}
+	// Make it absolute
+	if !filepath.IsAbs(localWork) {
+		if cwd, err := os.Getwd(); err == nil {
+			localWork = filepath.Join(cwd, localWork)
+		}
+	}
+
 	s := &SatelliteServer{
-		machineName: cfg.Machine.Name,
-		stationURL:  cfg.Station.URL,
-		apiPort:     cfg.StdoutAPI.Port,
-		sessions:    make(map[string]*Session),
-		tracker:     tracker,
-		mux:         http.NewServeMux(),
-		ctx:         ctx,
+		machineName:  cfg.Machine.Name,
+		stationURL:   cfg.Station.URL,
+		apiPort:      cfg.StdoutAPI.Port,
+		localWorkDir: localWork,
+		sessions:     make(map[string]*Session),
+		tracker:      tracker,
+		mux:          http.NewServeMux(),
+		ctx:          ctx,
 	}
 	s.registerRoutes()
 	return s
@@ -116,6 +132,9 @@ func (s *SatelliteServer) handleSpawn(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid spawn request", http.StatusBadRequest)
 		return
 	}
+
+	// Override WorkDir with satellite's local directory — station's path won't exist here
+	req.Config.WorkDir = s.localWorkDir
 
 	s.mu.Lock()
 	sess, exists := s.sessions[req.Name]
