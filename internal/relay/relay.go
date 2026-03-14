@@ -4,30 +4,41 @@ import (
 	"context"
 	"io/fs"
 	"log"
+	"log/slog"
 	"net/http"
+	"os"
 	"time"
 
 	"agent-relay/internal/config"
 	"agent-relay/internal/db"
 	"agent-relay/internal/ingest"
+	"agent-relay/internal/lock"
+	"agent-relay/internal/scheduler"
+	"agent-relay/internal/spawn"
 	"agent-relay/internal/vault"
 	"agent-relay/internal/web"
+	"agent-relay/internal/workflow"
 
 	"github.com/mark3labs/mcp-go/server"
 )
 
 // Relay is the main struct that wires together the MCP server, DB, and notifications.
 type Relay struct {
-	MCPServer    *server.MCPServer
-	HTTP         *server.StreamableHTTPServer
-	DB           *db.DB
-	Registry     *SessionRegistry
-	Ingester     *ingest.Ingester
-	VaultWatcher *vault.Watcher
-	Events       *EventBus
-	Config       config.Config
-	httpServer   *http.Server
-	StartedAt    time.Time
+	MCPServer      *server.MCPServer
+	HTTP           *server.StreamableHTTPServer
+	DB             *db.DB
+	Registry       *SessionRegistry
+	Ingester       *ingest.Ingester
+	VaultWatcher   *vault.Watcher
+	Events         *EventBus
+	SpawnMgr       *spawn.Manager
+	Scheduler      *scheduler.Scheduler
+	PTYMgr         *spawn.PTYManager
+	Handlers       *Handlers
+	WorkflowEngine *workflow.Engine
+	Config         config.Config
+	httpServer     *http.Server
+	StartedAt      time.Time
 }
 
 // New creates a fully wired Relay with all tools registered.
@@ -43,6 +54,43 @@ func New(database *db.DB, ingester *ingest.Ingester, vaultWatcher *vault.Watcher
 	events := NewEventBus()
 	registry := NewSessionRegistry(mcpSrv)
 	handlers := NewHandlers(database, registry, ingester, vaultWatcher, events)
+
+	// Initialize spawn infrastructure
+	logger := log.Default()
+	slogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	executor := spawn.NewExecutor(cfg.ClaudeBinary, slogger)
+	lockMgr := lock.NewManager(cfg.LocksDir, "relay-", slogger)
+	queue := lock.NewPriorityQueue(slogger)
+	sched := scheduler.New(slogger)
+
+	var spawnMgr *spawn.Manager
+	var ptyMgr *spawn.PTYManager
+	if executor.IsClaudeAvailable() {
+		spawnMgr = spawn.NewManager(database, executor, lockMgr, queue, sched, cfg.MaxPoolSize, slogger)
+		ptyMgr = spawn.NewPTYManager(executor)
+		handlers.SetSpawnManager(spawnMgr)
+		logger.Println("spawn: claude binary found, spawn/schedule/terminal enabled")
+	} else {
+		logger.Println("spawn: claude binary not found, spawn/schedule disabled")
+	}
+
+	// Initialize workflow engine
+	wfEngine := workflow.NewEngine(database, spawnMgr)
+	// Wire message and task functions so workflows can send messages and dispatch tasks
+	wfEngine.SetMessageFunc(func(project, from, to, msgType, subject, content string) error {
+		_, err := database.InsertMessage(project, from, to, msgType, subject, content, "{}", "P2", 0, nil, nil)
+		return err
+	})
+	wfEngine.SetTaskFunc(func(project, profile, title, desc string) (string, error) {
+		task, err := database.DispatchTask(project, profile, "workflow-engine", title, desc, "P2", nil, nil, nil)
+		if err != nil {
+			return "", err
+		}
+		return task.ID, nil
+	})
+
+	handlers.SetWorkflowEngine(wfEngine)
 
 	// Register all tools
 	mcpSrv.AddTools(
@@ -126,6 +174,15 @@ func New(database *db.DB, ingester *ingest.Ingester, vaultWatcher *vault.Watcher
 		server.ServerTool{Tool: removeTeamMemberTool(), Handler: handlers.HandleRemoveTeamMember},
 		server.ServerTool{Tool: getTeamInboxTool(), Handler: handlers.HandleGetTeamInbox},
 		server.ServerTool{Tool: addNotifyChannelTool(), Handler: handlers.HandleAddNotifyChannel},
+		// Spawn (fork/exec)
+		server.ServerTool{Tool: spawnTool(), Handler: handlers.HandleSpawn},
+		server.ServerTool{Tool: killChildTool(), Handler: handlers.HandleKillChild},
+		server.ServerTool{Tool: listChildrenTool(), Handler: handlers.HandleListChildren},
+		// Schedule (crontab)
+		server.ServerTool{Tool: scheduleTool(), Handler: handlers.HandleSchedule},
+		server.ServerTool{Tool: unscheduleTool(), Handler: handlers.HandleUnschedule},
+		server.ServerTool{Tool: listSchedulesTool(), Handler: handlers.HandleListSchedules},
+		server.ServerTool{Tool: triggerCycleTool(), Handler: handlers.HandleTriggerCycle},
 	)
 
 	httpSrv := server.NewStreamableHTTPServer(
@@ -136,15 +193,20 @@ func New(database *db.DB, ingester *ingest.Ingester, vaultWatcher *vault.Watcher
 	)
 
 	return &Relay{
-		MCPServer:    mcpSrv,
-		HTTP:         httpSrv,
-		DB:           database,
-		Registry:     registry,
-		Ingester:     ingester,
-		VaultWatcher: vaultWatcher,
-		Events:       events,
-		Config:       cfg,
-		StartedAt:    time.Now().UTC(),
+		MCPServer:      mcpSrv,
+		HTTP:           httpSrv,
+		DB:             database,
+		Registry:       registry,
+		Ingester:       ingester,
+		VaultWatcher:   vaultWatcher,
+		Events:         events,
+		SpawnMgr:       spawnMgr,
+		PTYMgr:         ptyMgr,
+		Scheduler:      sched,
+		Handlers:       handlers,
+		WorkflowEngine: wfEngine,
+		Config:         cfg,
+		StartedAt:      time.Now().UTC(),
 	}
 }
 

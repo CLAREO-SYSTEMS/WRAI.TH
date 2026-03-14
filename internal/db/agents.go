@@ -173,6 +173,35 @@ func (d *DB) GetAgentsByProfile(project, profileSlug string) ([]models.Agent, er
 	return agents, rows.Err()
 }
 
+// FindActiveAgentsBySkill returns active agents whose profile is linked to the given skill.
+func (d *DB) FindActiveAgentsBySkill(project, skillName string) ([]models.Agent, error) {
+	rows, err := d.ro().Query(
+		`SELECT a.id, a.name, a.role, a.description, a.registered_at, a.last_seen, a.project,
+		 a.reports_to, a.profile_slug, a.status, a.deactivated_at, a.is_executive, a.session_id,
+		 a.interest_tags, a.max_context_bytes
+		 FROM agents a
+		 JOIN profiles p ON p.slug = a.profile_slug AND p.project = a.project
+		 JOIN profile_skills ps ON ps.profile_id = p.id
+		 JOIN skills s ON s.id = ps.skill_id
+		 WHERE a.project = ? AND s.name = ? AND a.status = 'active'
+		 ORDER BY ps.proficiency, a.name`,
+		project, skillName,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("find agents by skill: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var agents []models.Agent
+	for rows.Next() {
+		a, err := scanAgent(rows)
+		if err != nil {
+			continue
+		}
+		agents = append(agents, a)
+	}
+	return agents, rows.Err()
+}
+
 func (d *DB) GetAgent(project, name string) (*models.Agent, error) {
 	a, err := scanAgent(d.ro().QueryRow("SELECT "+agentColumns+" FROM agents WHERE name = ? AND project = ?", name, project))
 	if err == sql.ErrNoRows {
