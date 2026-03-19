@@ -30,3 +30,4 @@ test.txt
 *.tmp
 *.log
 /tmp/
+.github/workflows/
